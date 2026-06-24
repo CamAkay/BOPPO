@@ -551,7 +551,7 @@ class PSSEFolder:
     def __init__(self, folder: str):
         self.folder = Path(folder)
         out_files = sorted(
-            list(self.folder.glob('*.out')) + list(self.folder.glob('*.outx')),
+            list(self.folder.rglob('*.out')) + list(self.folder.rglob('*.outx')),
             key=lambda p: p.name,
         )
         if not out_files:
@@ -1662,7 +1662,7 @@ class ExportDialog(QDialog):
 
     def __init__(self, psse_dir: str, pscad_dir: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Export All Results")
+        self.setWindowTitle("Export Results")
         self.setMinimumWidth(560)
         layout = QFormLayout(self)
         layout.setSpacing(8)
@@ -1690,37 +1690,56 @@ class ExportDialog(QDialog):
 
         # Format
         self._fmt = QComboBox()
-        self._fmt.addItems(['PDF (combined)', 'PDF (per page)', 'PNG (per page)'])
+        self._fmt.addItems([
+            'Current screen – PDF (single page)',
+            'Current screen – PNG (single page)',
+            'PDF (combined)',
+            'PDF (per page)',
+            'PNG (per page)',
+        ])
+        self._fmt.currentIndexChanged.connect(self._on_fmt_changed)
         layout.addRow("Output format:", self._fmt)
 
+        # Single-page filename
+        self._single_name_edit = QLineEdit("BOPPO_export")
+        self._single_name_label = QLabel("Filename (no ext):")
+        layout.addRow(self._single_name_label, self._single_name_edit)
+
         # Loop mode
+        self._loop_label = QLabel("Iteration:")
         self._loop_combo = QComboBox()
         self._loop_combo.addItems([
             'Loop PSSE files  (one page per PSSE result)',
             'Loop PSCAD files (one page per PSCAD result)',
         ])
-        layout.addRow("Iteration:", self._loop_combo)
+        layout.addRow(self._loop_label, self._loop_combo)
 
         # ── Title xlsx ────────────────────────────────────────────────────────
-        sep = QLabel("─── Page titles ──────────────────────────────────────")
-        sep.setStyleSheet("color: #888; font-size: 9px;")
-        layout.addRow(sep)
+        self._sep = QLabel("─── Page titles ──────────────────────────────────────")
+        self._sep.setStyleSheet("color: #888; font-size: 9px;")
+        layout.addRow(self._sep)
+
+        self._use_xlsx_chk = QCheckBox("Use title xlsx for page names")
+        default_xlsx = self._find_default_xlsx()
+        self._use_xlsx_chk.setChecked(bool(default_xlsx))
+        self._use_xlsx_chk.toggled.connect(self._on_xlsx_toggled)
+        layout.addRow("", self._use_xlsx_chk)
 
         # Auto-detect an xlsx in the default folder
-        default_xlsx = self._find_default_xlsx()
         self._xlsx_edit = QLineEdit(default_xlsx)
         self._xlsx_edit.setPlaceholderText("(leave blank to use dataset filename)")
         btn_x = QPushButton("Browse…")
         btn_x.clicked.connect(self._pick_xlsx)
         h4 = QHBoxLayout(); h4.addWidget(self._xlsx_edit); h4.addWidget(btn_x)
-        layout.addRow("Title xlsx:", h4)
+        self._xlsx_label = QLabel("Title xlsx:")
+        layout.addRow(self._xlsx_label, h4)
 
-        note = QLabel(
+        self._xlsx_note = QLabel(
             "Row 1 = variable names  |  Rows 2+ = one row per exported page\n"
             "Empty cells are omitted from the title."
         )
-        note.setStyleSheet("color: #666; font-size: 9px;")
-        layout.addRow("", note)
+        self._xlsx_note.setStyleSheet("color: #666; font-size: 9px;")
+        layout.addRow("", self._xlsx_note)
 
         self._title_prefix = QLineEdit()
         self._title_prefix.setPlaceholderText("optional prefix added before xlsx values")
@@ -1730,6 +1749,29 @@ class ExportDialog(QDialog):
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         layout.addRow(btns)
+
+        # Apply initial visibility
+        self._on_fmt_changed(0)
+        self._on_xlsx_toggled(self._use_xlsx_chk.isChecked())
+
+    def _on_fmt_changed(self, _index: int):
+        single = self._fmt.currentText().startswith('Current screen')
+        self._single_name_label.setVisible(single)
+        self._single_name_edit.setVisible(single)
+        self._loop_label.setVisible(not single)
+        self._loop_combo.setVisible(not single)
+        self._sep.setVisible(not single)
+        self._use_xlsx_chk.setVisible(not single)
+        self._xlsx_label.setVisible(not single and self._use_xlsx_chk.isChecked())
+        self._xlsx_edit.setVisible(not single and self._use_xlsx_chk.isChecked())
+        self._xlsx_note.setVisible(not single and self._use_xlsx_chk.isChecked())
+
+    def _on_xlsx_toggled(self, checked: bool):
+        single = self._fmt.currentText().startswith('Current screen')
+        visible = checked and not single
+        self._xlsx_label.setVisible(visible)
+        self._xlsx_edit.setVisible(visible)
+        self._xlsx_note.setVisible(visible)
 
     @classmethod
     def _find_default_xlsx(cls) -> str:
@@ -1766,8 +1808,11 @@ class ExportDialog(QDialog):
             'pscad_folder':   self._pscad_edit.text().strip(),
             'out_folder':     self._out_edit.text().strip(),
             'format':         self._fmt.currentText(),
+            'single_page':    self._fmt.currentText().startswith('Current screen'),
+            'single_name':    self._single_name_edit.text().strip() or 'BOPPO_export',
             'loop_psse':      self._loop_combo.currentIndex() == 0,
-            'title_xlsx':     self._xlsx_edit.text().strip(),
+            'use_xlsx':       self._use_xlsx_chk.isChecked(),
+            'title_xlsx':     self._xlsx_edit.text().strip() if self._use_xlsx_chk.isChecked() else '',
             'title_prefix':   self._title_prefix.text().strip(),
         }
 
@@ -2450,7 +2495,40 @@ class MainWindow(QMainWindow):
 
         layout = self._plot_grid.get_layout_config()
         offset = self._offset_spin.value()
+        out_dir = Path(p['out_folder'])
+        fmt     = p['format']
 
+        # ── Single-page (current screen) export ───────────────────────────────
+        if p['single_page']:
+            psse_ds  = (self._psse_folder.datasets[self._psse_sel.currentIndex()]
+                        if self._psse_folder and self._psse_folder.datasets
+                        and 0 <= self._psse_sel.currentIndex() < len(self._psse_folder.datasets)
+                        else None)
+            pscad_ds = self._pscad_folder if self._pscad_folder else None
+            field_ds = self._field_ds if self._field_ds else None
+            try:
+                fig = self._plot_grid.render_page(
+                    psse_ds, pscad_ds, offset, layout,
+                    global_xmin=self._plot_grid._global_xmin,
+                    global_xmax=self._plot_grid._global_xmax,
+                    field_ds=field_ds,
+                )
+                name = p['single_name']
+                if 'PDF' in fmt:
+                    out_path = str(out_dir / f"{name}.pdf")
+                    fig.savefig(out_path, bbox_inches='tight')
+                else:
+                    out_path = str(out_dir / f"{name}.png")
+                    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+                plt.close(fig)
+                QMessageBox.information(self, "Export Complete",
+                                        f"Saved to:\n{out_path}")
+            except Exception as ex:
+                plt.close('all')
+                QMessageBox.critical(self, "Export Error", str(ex))
+            return
+
+        # ── Batch (loop) export ───────────────────────────────────────────────
         # Load source folders
         try:
             psse_folder  = PSSEFolder(p['psse_folder'])  if p['psse_folder']  else None
@@ -2461,7 +2539,7 @@ class MainWindow(QMainWindow):
 
         if p['loop_psse']:
             primary_list = psse_folder.datasets if psse_folder else []
-            fixed_pscad  = pscad_folder          # pass whole folder for cross-file routing
+            fixed_pscad  = pscad_folder
             fixed_psse   = None
         else:
             primary_list = pscad_folder.datasets if pscad_folder else []
@@ -2472,8 +2550,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export", "No result files found to loop over.")
             return
 
-        out_dir = Path(p['out_folder'])
-        fmt     = p['format']
         prefix  = p.get('title_prefix', '').strip()
 
         # Load per-page titles from xlsx if provided

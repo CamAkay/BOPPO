@@ -31,5 +31,7 @@ python boppo.py
 - Interactive plots: drag-and-drop channels, rectangle zoom, hover crosshair with interpolated readouts
 - Per-channel mathematical transforms (e.g. `y*50+10`, `abs(y)`)
 - Signal analysis: rise time (10–90%), settle time (configurable band), ±10% error bands
-- Batch export to PDF or PNG, with optional XLSX title template per page
+- Export current screen as a single-page PDF or PNG (no batch loop required)
+- Batch export to PDF or PNG across all PSSE or PSCAD result files, with optional XLSX title template per page
+- PSS/E folder loading searches subdirectories recursively for `.out`/`.outx` files
 - Save/load plot layouts as `.boppo` template files
