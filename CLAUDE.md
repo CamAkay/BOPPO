@@ -30,16 +30,16 @@ Format-agnostic backends, all exposing `get(channel_name) → (time_array, data_
 - **PSCAD v5:** `PSCADPsoutFolder` — reads `.psout` via `mhi.psout`
 - **Field data:** `FieldDataset` — reads CSV/XLSX with a datetime first column, auto-converted to elapsed seconds
 
-### Visualization Layer (lines ~57–221, ~981–1430)
+### Visualization Layer (lines ~57–221, ~804–1651)
+- Standalone helpers: `_autoscale_y_to_xlim`, `_compute_signal_metrics` (rise time 10–90%, settle time), `_draw_analysis_overlay`
 - `PlotWidget` — a single matplotlib panel; handles drag-drop, rectangle-zoom, hover crosshair
 - `PlotGrid` — resizable N×M grid of `PlotWidget`s; `render_page()` renders off-screen for batch export
 - `PlotConfigDialog` — per-plot settings (titles, axis labels, limits, per-channel transforms)
-- Signal analysis: rise time (10–90%), settle time (configurable band %), ±10% error bands
 
-### UI Layer (lines ~709–1778)
-- `ChannelBrowser` — tree widget (PSSE blue / PSCAD red / Field Data teal) with drag-source MIME data
-- `MainWindow` — two tabs: *PSSE vs PSCAD* and *Field Data Overlay*
-- Batch export loop over PSSE or PSCAD files → PDF (combined or per-page) or PNG, with optional XLSX title template
+### UI Layer (lines ~709–2435)
+- `ChannelBrowser` (~709–802) — tree widget (PSSE blue / PSCAD red / Field Data teal) with drag-source MIME data
+- `MainWindow` — two independent tabs with near-identical logic; Tab 2 methods use `_t2_` prefix throughout
+- `ExportDialog` (~1657–1772) — batch export over PSSE or PSCAD files → PDF (combined or per-page) or PNG, with optional XLSX title template
 
 ### Persistence (lines ~2209–2396)
 - `.boppo` files — JSON-serialized plot layouts (save/load templates)

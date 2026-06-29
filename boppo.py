@@ -18,14 +18,19 @@ import re
 import json
 import copy
 import logging
+import datetime
 PSSE_LOCATION = r"C:\Program Files\PTI\PSSE36\36.5\PSSPY314"
-sys.path.append(PSSE_LOCATION)
-os.environ['PATH'] = os.environ['PATH'] + ';' +  PSSE_LOCATION 
-# PSSE 34 imports
-import psse3605
-import psspy
-# import redirect
-import dyntools
+PSSE_AVAILABLE = False
+if os.path.isdir(PSSE_LOCATION):
+    sys.path.append(PSSE_LOCATION)
+    os.environ['PATH'] = os.environ['PATH'] + ';' + PSSE_LOCATION
+    try:
+        import psse3605   # noqa: F401
+        import psspy       # noqa: F401
+        import dyntools    # noqa: F401
+        PSSE_AVAILABLE = True
+    except Exception:
+        pass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -1745,6 +1750,19 @@ class ExportDialog(QDialog):
         self._title_prefix.setPlaceholderText("optional prefix added before xlsx values")
         layout.addRow("Title prefix:", self._title_prefix)
 
+        # ── PDF title options ─────────────────────────────────────────────────
+        self._sep2 = QLabel("─── PDF title options ────────────────────────────────")
+        self._sep2.setStyleSheet("color: #888; font-size: 9px;")
+        layout.addRow(self._sep2)
+
+        self._use_outfile_chk = QCheckBox("Use outfile name as PDF title")
+        self._use_outfile_chk.setChecked(True)
+        layout.addRow("", self._use_outfile_chk)
+
+        self._use_date_chk = QCheckBox("Include export date in PDF title")
+        self._use_date_chk.setChecked(True)
+        layout.addRow("", self._use_date_chk)
+
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
@@ -1756,6 +1774,7 @@ class ExportDialog(QDialog):
 
     def _on_fmt_changed(self, _index: int):
         single = self._fmt.currentText().startswith('Current screen')
+        is_pdf = 'PDF' in self._fmt.currentText()
         self._single_name_label.setVisible(single)
         self._single_name_edit.setVisible(single)
         self._loop_label.setVisible(not single)
@@ -1765,6 +1784,9 @@ class ExportDialog(QDialog):
         self._xlsx_label.setVisible(not single and self._use_xlsx_chk.isChecked())
         self._xlsx_edit.setVisible(not single and self._use_xlsx_chk.isChecked())
         self._xlsx_note.setVisible(not single and self._use_xlsx_chk.isChecked())
+        self._sep2.setVisible(is_pdf and not single)
+        self._use_outfile_chk.setVisible(is_pdf and not single)
+        self._use_date_chk.setVisible(is_pdf and not single)
 
     def _on_xlsx_toggled(self, checked: bool):
         single = self._fmt.currentText().startswith('Current screen')
@@ -1814,6 +1836,8 @@ class ExportDialog(QDialog):
             'use_xlsx':       self._use_xlsx_chk.isChecked(),
             'title_xlsx':     self._xlsx_edit.text().strip() if self._use_xlsx_chk.isChecked() else '',
             'title_prefix':   self._title_prefix.text().strip(),
+            'title_outfile':  self._use_outfile_chk.isChecked(),
+            'title_date':     self._use_date_chk.isChecked(),
         }
 
 
@@ -2551,6 +2575,9 @@ class MainWindow(QMainWindow):
             return
 
         prefix  = p.get('title_prefix', '').strip()
+        use_outfile = p.get('title_outfile', True)
+        use_date    = p.get('title_date', True)
+        export_date = datetime.date.today().strftime('%d %b %Y') if use_date else ''
 
         # Load per-page titles from xlsx if provided
         xlsx_titles: List[str] = []
@@ -2569,9 +2596,11 @@ class MainWindow(QMainWindow):
                 parts.append(prefix)
             if i < len(xlsx_titles) and xlsx_titles[i]:
                 parts.append(xlsx_titles[i])
-            elif not prefix:
+            if use_outfile:
                 parts.append(fallback)
-            return '   '.join(parts)
+            if export_date:
+                parts.append(export_date)
+            return '   '.join(parts) if parts else fallback
 
         # Progress
         prog = QProgressDialog("Exporting pages…", "Cancel", 0, len(primary_list), self)
