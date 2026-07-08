@@ -51,6 +51,7 @@ from PyQt5.QtGui import QColor, QFont, QDrag, QCursor
 import matplotlib
 matplotlib.use('Qt5Agg')
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
@@ -1538,11 +1539,13 @@ class PlotGrid(QWidget):
         rows   = layout.get('rows', self._rows)
         cols   = layout.get('cols', self._cols)
         snaps  = layout.get('plots', [])
-        fig, axes = plt.subplots(
-            rows, cols,
-            figsize=(cols * 5.0, rows * 3.5),
-            tight_layout=True,
-        )
+        # Build off-screen with a plain Agg canvas rather than pyplot's
+        # interactive Qt5Agg backend — creating/destroying Qt5Agg figures
+        # from inside a button click reenters the running QApplication's
+        # Qt event loop and can crash the app (Qt5Core stack corruption).
+        fig = Figure(figsize=(cols * 5.0, rows * 3.5), tight_layout=True)
+        FigureCanvasAgg(fig)
+        axes = fig.subplots(rows, cols)
         # Normalise axes array to 2-D
         axes = np.atleast_2d(axes if cols > 1 else np.array(axes)[:, np.newaxis]
                              if rows > 1 else np.array([[axes]]))
@@ -1993,6 +1996,9 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(load_tpl_btn)
 
         toolbar.addStretch()
+        export_pdf_btn = QPushButton("📄  Export PDF")
+        export_pdf_btn.clicked.connect(self._export_current_pdf)
+        toolbar.addWidget(export_pdf_btn)
         export_btn = QPushButton("📄  Export All…")
         export_btn.setStyleSheet("font-weight: bold; padding: 5px 16px;")
         export_btn.clicked.connect(self._export)
@@ -2481,7 +2487,13 @@ class MainWindow(QMainWindow):
             and 0 <= self._t2_psse_sel.currentIndex() < len(self._t2_psse_folder.datasets)
             else None
         )
-        pscad_ds = self._t2_pscad_folder if self._t2_pscad_folder else None
+        pscad_idx = self._t2_pscad_sel.currentIndex()
+        pscad_ds = (
+            self._t2_pscad_folder.datasets[pscad_idx]
+            if self._t2_pscad_folder and self._t2_pscad_folder.datasets
+            and 0 <= pscad_idx < len(self._t2_pscad_folder.datasets)
+            else self._t2_pscad_folder
+        )
 
         try:
             fig = self._t2_plot_grid.render_page(
@@ -2503,6 +2515,50 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export Error", str(ex))
 
     # ── Export ────────────────────────────────────────────────────────────────
+
+    def _export_current_pdf(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Displayed Data", "",
+            "PDF (*.pdf);;PNG (*.png);;All files (*)"
+        )
+        if not path:
+            return
+
+        layout = self._plot_grid.get_layout_config()
+        offset = self._offset_spin.value()
+
+        psse_ds = (
+            self._psse_folder.datasets[self._psse_sel.currentIndex()]
+            if self._psse_folder and self._psse_folder.datasets
+            and 0 <= self._psse_sel.currentIndex() < len(self._psse_folder.datasets)
+            else None
+        )
+        pscad_idx = self._pscad_sel.currentIndex()
+        pscad_ds = (
+            self._pscad_folder.datasets[pscad_idx]
+            if self._pscad_folder and self._pscad_folder.datasets
+            and 0 <= pscad_idx < len(self._pscad_folder.datasets)
+            else self._pscad_folder
+        )
+
+        try:
+            fig = self._plot_grid.render_page(
+                psse_ds, pscad_ds, offset, layout,
+                global_xmin=self._plot_grid._global_xmin,
+                global_xmax=self._plot_grid._global_xmax,
+                field_ds=None,
+            )
+            if path.lower().endswith('.png'):
+                fig.savefig(path, dpi=150, bbox_inches='tight')
+            else:
+                if not path.lower().endswith('.pdf'):
+                    path += '.pdf'
+                fig.savefig(path, bbox_inches='tight')
+            plt.close(fig)
+            QMessageBox.information(self, "Export Complete", f"Saved to:\n{path}")
+        except Exception as ex:
+            plt.close('all')
+            QMessageBox.critical(self, "Export Error", str(ex))
 
     def _export(self):
         psse_dir  = str(self._psse_folder.folder)  if self._psse_folder  else ''
@@ -2528,14 +2584,19 @@ class MainWindow(QMainWindow):
                         if self._psse_folder and self._psse_folder.datasets
                         and 0 <= self._psse_sel.currentIndex() < len(self._psse_folder.datasets)
                         else None)
-            pscad_ds = self._pscad_folder if self._pscad_folder else None
-            field_ds = self._field_ds if self._field_ds else None
+            pscad_idx = self._pscad_sel.currentIndex()
+            pscad_ds = (
+                self._pscad_folder.datasets[pscad_idx]
+                if self._pscad_folder and self._pscad_folder.datasets
+                and 0 <= pscad_idx < len(self._pscad_folder.datasets)
+                else self._pscad_folder
+            )
             try:
                 fig = self._plot_grid.render_page(
                     psse_ds, pscad_ds, offset, layout,
                     global_xmin=self._plot_grid._global_xmin,
                     global_xmax=self._plot_grid._global_xmax,
-                    field_ds=field_ds,
+                    field_ds=None,
                 )
                 name = p['single_name']
                 if 'PDF' in fmt:
