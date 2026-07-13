@@ -330,6 +330,19 @@ def _parse_pscad_inf(inf_path: str) -> Dict[int, dict]:
                     'group': m.group(3),
                     'units': m.group(4),
                 }
+
+    # PSCAD lets multiple PGBs share the same Desc (e.g. array/profile outputs
+    # recorded once per group). Disambiguate with the group name so each is a
+    # distinct, individually-selectable channel instead of colliding on lookup.
+    desc_counts: Dict[str, int] = {}
+    for meta in channels.values():
+        desc_counts[meta['desc']] = desc_counts.get(meta['desc'], 0) + 1
+    for meta in channels.values():
+        if desc_counts[meta['desc']] > 1:
+            meta['name'] = f"{meta['desc']} [{meta['group']}]"
+        else:
+            meta['name'] = meta['desc']
+
     return channels
 
 
@@ -353,10 +366,10 @@ class PSCADDataset:
         return self._data[:, 0]
 
     def get(self, name: str) -> Tuple[np.ndarray, np.ndarray]:
-        """Return (time, signal) for channel with matching description."""
+        """Return (time, signal) for channel with matching name."""
         self.load()
         for idx, meta in self.channels.items():
-            if meta['desc'] == name:
+            if meta['name'] == name:
                 return self._data[:, 0], self._data[:, idx]
         raise KeyError(f"PSCAD channel '{name}' not found")
 
@@ -385,11 +398,11 @@ class PSCADSimResult:
         ]
 
     def channel_names(self) -> List[str]:
-        return [m['desc'] for m in self.channels.values()]
+        return [m['name'] for m in self.channels.values()]
 
     def channel_units(self, name: str) -> str:
         for m in self.channels.values():
-            if m['desc'] == name:
+            if m['name'] == name:
                 return m['units']
         return ''
 
@@ -397,7 +410,7 @@ class PSCADSimResult:
         """Return (time, signal), routing to the correct .out channel-split file."""
         target_idx = None
         for idx, meta in self.channels.items():
-            if meta['desc'] == name:
+            if meta['name'] == name:
                 target_idx = idx
                 break
         if target_idx is None:
