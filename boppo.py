@@ -43,6 +43,7 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox, QFileDialog, QMessageBox, QProgressDialog,
     QSizePolicy, QSplitter, QAction, QToolBar, QCheckBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget,
+    QListWidget, QListWidgetItem,
 )
 from matplotlib.widgets import RectangleSelector
 from PyQt5.QtCore import Qt, QMimeData, QByteArray, pyqtSignal
@@ -58,6 +59,27 @@ import matplotlib.pyplot as plt
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+# ─── legend label helper ─────────────────────────────────────────────────────
+
+def _channel_legend_label(ch: dict, cfg: dict, seen_sources: Optional[set] = None) -> str:
+    """Build a legend label for a plotted channel, honouring the per-plot
+    'legend_mode' setting: 'name' (channel name + source) or 'source'
+    (just the source, e.g. 'PSSE' / 'PSCAD' / 'Field'). When grouping by
+    source, `seen_sources` (shared across a plot's channels) is used to
+    suppress duplicate legend entries for repeated sources."""
+    if cfg.get('legend_mode', 'name') == 'source':
+        key = ch.get('dataset_id', ch['source'])
+        if seen_sources is not None:
+            if key in seen_sources:
+                return '_nolegend_'
+            seen_sources.add(key)
+        return ch.get('dataset_label', ch['source'])
+    label = f"{ch.get('dataset_label', ch['source'])}: {ch['name']}"
+    if ch.get('units'):
+        label += f"  [{ch['units']}]"
+    return label
 
 
 # ─── y-axis auto-scale helper ────────────────────────────────────────────────
@@ -268,6 +290,19 @@ LINE_COLORS  = [
     '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
     '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5',
 ]
+
+# Standard page sizes for PDF/PNG export, in inches (width, height).
+# 'Auto (fit grid)' preserves the original behaviour of sizing the page
+# to the plot grid dimensions rather than a fixed paper size.
+PAGE_SIZES: Dict[str, Optional[Tuple[float, float]]] = {
+    'Auto (fit grid)':   None,
+    'A4 Landscape':      (11.69, 8.27),
+    'A4 Portrait':       (8.27, 11.69),
+    'A3 Landscape':      (16.54, 11.69),
+    'A3 Portrait':       (11.69, 16.54),
+    'Letter Landscape':  (11.0, 8.5),
+    'Letter Portrait':   (8.5, 11.0),
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -712,27 +747,172 @@ def _try_float(v):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DATASET REGISTRY (per-tab, multi-dataset)
+# ══════════════════════════════════════════════════════════════════════════════
+
+KIND_COLOR = {'PSSE': PSSE_COLOR, 'PSCAD': PSCAD_COLOR, 'Field': '#2a9d8f'}
+
+
+class LoadedDataset:
+    """One loaded folder/file within a tab's registry."""
+
+    def __init__(self, kind: str, label: str, folder_obj, dataset_id: str):
+        self.kind = kind              # 'PSSE' | 'PSCAD' | 'Field'
+        self.label = label            # user-visible, defaults to folder.name
+        self.folder_obj = folder_obj  # PSSEFolder/PSCADFolder/PSCADPsoutFolder/FieldDataset
+        self.id = dataset_id          # stable short id, e.g. 'psse-0'
+        self.sel_index = 0            # active internal sub-dataset
+        self.path = ''
+
+    def active_source(self):
+        """Return the object exposing get(name) for the active sub-dataset."""
+        ds_list = getattr(self.folder_obj, 'datasets', None)
+        if ds_list and 0 <= self.sel_index < len(ds_list):
+            return ds_list[self.sel_index]
+        return self.folder_obj
+
+
+class DatasetRegistry:
+    """Holds every dataset loaded into one tab, keyed by a stable id.
+
+    Ids are generated as ``f"{kind.lower()}-{n}"`` where n increments a per-kind
+    counter that is never reused, so old assigned-channel dicts referencing a
+    removed id fail gracefully rather than binding to an unrelated folder."""
+
+    def __init__(self):
+        self._datasets: "Dict[str, LoadedDataset]" = {}
+        self._counters: Dict[str, int] = {'PSSE': 0, 'PSCAD': 0, 'Field': 0}
+
+    def _next_id(self, kind: str, forced_id: Optional[str] = None) -> str:
+        if forced_id is not None:
+            try:
+                n = int(str(forced_id).rsplit('-', 1)[-1])
+                if n >= self._counters.get(kind, 0):
+                    self._counters[kind] = n + 1
+            except ValueError:
+                pass
+            return forced_id
+        n = self._counters.get(kind, 0)
+        self._counters[kind] = n + 1
+        return f"{kind.lower()}-{n}"
+
+    def _unique_label(self, kind: str, label: str) -> str:
+        existing = {d.label for d in self._datasets.values() if d.kind == kind}
+        if label not in existing:
+            return label
+        n = 2
+        while f"{label} ({n})" in existing:
+            n += 1
+        return f"{label} ({n})"
+
+    def _add(self, kind, folder_obj, path, forced_id, label) -> str:
+        if not label:
+            label = Path(path).name
+        label = self._unique_label(kind, label)
+        ds_id = self._next_id(kind, forced_id)
+        entry = LoadedDataset(kind, label, folder_obj, ds_id)
+        entry.path = str(path)
+        self._datasets[ds_id] = entry
+        return ds_id
+
+    def add_psse(self, folder_path, forced_id=None, label=None) -> str:
+        return self._add('PSSE', PSSEFolder(folder_path), folder_path, forced_id, label)
+
+    def add_pscad(self, folder_path, forced_id=None, label=None) -> str:
+        if list(Path(folder_path).glob('*.psout')):
+            folder = PSCADPsoutFolder(folder_path)
+        else:
+            folder = PSCADFolder(folder_path)
+        return self._add('PSCAD', folder, folder_path, forced_id, label)
+
+    def add_field(self, path, forced_id=None, label=None) -> str:
+        ds = FieldDataset(path)
+        _ = ds.channels   # trigger load + validate
+        return self._add('Field', ds, path, forced_id, label)
+
+    def remove(self, dataset_id: str):
+        self._datasets.pop(dataset_id, None)
+
+    def get(self, dataset_id: Optional[str]) -> Optional[LoadedDataset]:
+        return self._datasets.get(dataset_id) if dataset_id else None
+
+    def all(self) -> "List[LoadedDataset]":
+        return list(self._datasets.values())
+
+    def all_of_kind(self, kind: str) -> "List[LoadedDataset]":
+        return [d for d in self._datasets.values() if d.kind == kind]
+
+    def first_of_kind(self, kind: str) -> Optional[LoadedDataset]:
+        for d in self._datasets.values():
+            if d.kind == kind:
+                return d
+        return None
+
+    def export_manifest(self) -> List[dict]:
+        return [{'id': d.id, 'kind': d.kind, 'label': d.label, 'path': d.path}
+                for d in self._datasets.values()]
+
+    @classmethod
+    def from_single(cls, psse_ds=None, pscad_ds=None, field_ds=None) -> "DatasetRegistry":
+        """Build a throwaway single-dataset-per-kind registry for batch export."""
+        reg = cls()
+        for kind, obj in (('PSSE', psse_ds), ('PSCAD', pscad_ds), ('Field', field_ds)):
+            if obj is not None:
+                ds_id = reg._next_id(kind)
+                reg._datasets[ds_id] = LoadedDataset(kind, kind, obj, ds_id)
+        return reg
+
+
+def _resolve_dataset(registry, ch: dict) -> Optional[LoadedDataset]:
+    """Resolve an assigned channel dict to its LoadedDataset. Falls back to the
+    first loaded dataset of the channel's kind (legacy schema-v1 templates and
+    batch export both rely on this)."""
+    if registry is None:
+        return None
+    entry = registry.get(ch.get('dataset_id'))
+    if entry is None:
+        entry = registry.first_of_kind(ch['source'])
+    return entry
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CHANNEL BROWSER (left panel)
 # ══════════════════════════════════════════════════════════════════════════════
+
+FIELD_COLOR = '#2a9d8f'   # teal for field data
+
+
+class _DatasetNode(QTreeWidgetItem):
+    """A tree node grouping all channels of one loaded dataset."""
+
+    def __init__(self, parent: QTreeWidgetItem, dataset_id: str, label: str):
+        super().__init__(parent, [label])
+        self.dataset_id = dataset_id
+        self.dataset_label = label
+
 
 class _ChannelItem(QTreeWidgetItem):
     """A draggable leaf item representing one signal channel."""
 
     def __init__(self, parent: QTreeWidgetItem, source: str,
-                 name: str, units: str = ''):
+                 name: str, units: str = '', dataset_id: str = '',
+                 dataset_label: str = ''):
         display = f"{name}  [{units}]" if units else name
         super().__init__(parent, [display])
         self.channel_source = source
         self.channel_name   = name
         self.channel_units  = units
-        self.setToolTip(0, f"[{source}]  {name}" + (f"  ({units})" if units else ''))
+        self.channel_dataset_id = dataset_id
+        self.channel_dataset_label = dataset_label
+        tip = f"[{source}]  {name}" + (f"  ({units})" if units else '')
+        if dataset_label:
+            tip += f"\nDataset: {dataset_label}"
+        self.setToolTip(0, tip)
 
-
-FIELD_COLOR = '#2a9d8f'   # teal for field data
 
 class ChannelBrowser(QTreeWidget):
-    """Tree widget with three top-level groups (PSSE / PSCAD / Field Data).
-    Channels are drag-source items carrying JSON MIME data."""
+    """Tree widget grouped format -> dataset -> channel.
+    Channels are drag-source items carrying JSON MIME data (incl. dataset id)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -745,47 +925,61 @@ class ChannelBrowser(QTreeWidget):
 
         bold = QFont(); bold.setBold(True)
 
-        self._psse_root  = QTreeWidgetItem(self, ['PSSE'])
-        self._psse_root.setFont(0, bold)
-        self._psse_root.setForeground(0, QColor(PSSE_COLOR))
-
-        self._pscad_root = QTreeWidgetItem(self, ['PSCAD'])
-        self._pscad_root.setFont(0, bold)
-        self._pscad_root.setForeground(0, QColor(PSCAD_COLOR))
-
-        self._field_root = QTreeWidgetItem(self, ['Field Data'])
-        self._field_root.setFont(0, bold)
-        self._field_root.setForeground(0, QColor(FIELD_COLOR))
+        self._format_roots: Dict[str, QTreeWidgetItem] = {}
+        for kind, label in (('PSSE', 'PSSE'), ('PSCAD', 'PSCAD'),
+                            ('Field', 'Field Data')):
+            root = QTreeWidgetItem(self, [label])
+            root.setFont(0, bold)
+            root.setForeground(0, QColor(KIND_COLOR[kind]))
+            self._format_roots[kind] = root
 
         self.expandAll()
 
     # ── Populate ─────────────────────────────────────────────────────────────
 
-    def set_psse_channels(self, names: List[str]):
-        self._psse_root.takeChildren()
-        for name in names:
-            _ChannelItem(self._psse_root, 'PSSE', name)
-        self._psse_root.setExpanded(True)
+    def _find_or_create_dataset_node(self, root, dataset_id, label) -> _DatasetNode:
+        for i in range(root.childCount()):
+            node = root.child(i)
+            if isinstance(node, _DatasetNode) and node.dataset_id == dataset_id:
+                return node
+        bold = QFont(); bold.setBold(True)
+        node = _DatasetNode(root, dataset_id, label)
+        node.setFont(0, bold)
+        root.setExpanded(True)
+        return node
 
-    def set_pscad_channels(self, names: List[str], units_fn=None):
-        self._pscad_root.takeChildren()
+    def set_dataset_channels(self, kind: str, dataset_id: str, label: str,
+                             names: List[str], units_fn=None):
+        root = self._format_roots[kind]
+        node = self._find_or_create_dataset_node(root, dataset_id, label)
+        node.takeChildren()
         for name in names:
             units = units_fn(name) if units_fn else ''
-            _ChannelItem(self._pscad_root, 'PSCAD', name, units)
-        self._pscad_root.setExpanded(True)
+            _ChannelItem(node, kind, name, units, dataset_id, label)
+        node.setExpanded(True)
 
-    def set_field_channels(self, names: List[str]):
-        self._field_root.takeChildren()
-        for name in names:
-            _ChannelItem(self._field_root, 'Field', name)
-        self._field_root.setExpanded(True)
+    def remove_dataset(self, kind: str, dataset_id: str):
+        root = self._format_roots.get(kind)
+        if root is None:
+            return
+        for i in range(root.childCount()):
+            node = root.child(i)
+            if isinstance(node, _DatasetNode) and node.dataset_id == dataset_id:
+                root.takeChild(i)
+                return
 
     def filter_text(self, text: str):
         text = text.lower()
-        for root in (self._psse_root, self._pscad_root, self._field_root):
+        for root in self._format_roots.values():
             for i in range(root.childCount()):
-                item = root.child(i)
-                item.setHidden(bool(text) and text not in item.text(0).lower())
+                node = root.child(i)
+                any_visible = False
+                for j in range(node.childCount()):
+                    item = node.child(j)
+                    hidden = bool(text) and text not in item.text(0).lower()
+                    item.setHidden(hidden)
+                    any_visible = any_visible or not hidden
+                node.setHidden(bool(text) and not any_visible)
 
     # ── Drag ─────────────────────────────────────────────────────────────────
 
@@ -794,9 +988,11 @@ class ChannelBrowser(QTreeWidget):
         if not items:
             return
         payload = json.dumps([
-            {'source': i.channel_source,
-             'name':   i.channel_name,
-             'units':  i.channel_units}
+            {'source':        i.channel_source,
+             'dataset_id':    i.channel_dataset_id,
+             'dataset_label': i.channel_dataset_label,
+             'name':          i.channel_name,
+             'units':         i.channel_units}
             for i in items
         ]).encode()
         mime = QMimeData()
@@ -828,10 +1024,19 @@ class PlotConfigDialog(QDialog):
         self._legend = QCheckBox()
         self._legend.setChecked(config.get('legend', True))
 
+        self._legend_mode = QComboBox()
+        self._legend_mode.addItem("Channel name", 'name')
+        self._legend_mode.addItem("Source only (PSSE / PSCAD)", 'source')
+        mode_idx = self._legend_mode.findData(config.get('legend_mode', 'name'))
+        self._legend_mode.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
+        self._legend.toggled.connect(self._legend_mode.setEnabled)
+        self._legend_mode.setEnabled(self._legend.isChecked())
+
         layout.addRow("Title:",   self._title)
         layout.addRow("X label:", self._xlabel)
         layout.addRow("Y label:", self._ylabel)
         layout.addRow("Legend:",  self._legend)
+        layout.addRow("Legend labels:", self._legend_mode)
 
         # Axis limits – leave blank for auto-scale
         def _fmt(v):
@@ -891,21 +1096,17 @@ class PlotConfigDialog(QDialog):
         xfm_note.setWordWrap(True)
         layout.addRow("", xfm_note)
 
-        n = len(assigned)
-        self._xfm_table = QTableWidget(n, 2)
-        self._xfm_table.setHorizontalHeaderLabels(['Channel', 'Expression'])
+        self._current_assigned = list(assigned)   # working copy; rows can be removed
+        self._xfm_table = QTableWidget(0, 3)
+        self._xfm_table.setHorizontalHeaderLabels(['Channel', 'Expression', ''])
         self._xfm_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self._xfm_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._xfm_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self._xfm_table.verticalHeader().setVisible(False)
-        self._xfm_table.setMinimumHeight(min(n * 28 + 28, 180))
-        for i, ch in enumerate(assigned):
-            name_item = QTableWidgetItem(f"[{ch['source']}]  {ch['name']}")
-            name_item.setFlags(Qt.ItemIsEnabled)   # read-only
-            expr_item = QTableWidgetItem(ch.get('transform', 'y'))
-            self._xfm_table.setItem(i, 0, name_item)
-            self._xfm_table.setItem(i, 1, expr_item)
-        if n:
-            layout.addRow("Transforms:", self._xfm_table)
+        self._xfm_table_row = QLabel("Transforms:")
+        self._rebuild_xfm_table()
+        if assigned:
+            layout.addRow(self._xfm_table_row, self._xfm_table)
 
         # ── Signal analysis ───────────────────────────────────────────────────
         ana_sep = QLabel("─── Signal analysis ──────────────────────────────")
@@ -956,6 +1157,7 @@ class PlotConfigDialog(QDialog):
             'xlabel':             self._xlabel.text(),
             'ylabel':             self._ylabel.text(),
             'legend':             self._legend.isChecked(),
+            'legend_mode':        self._legend_mode.currentData(),
             'xmin':               self._parse(self._xmin.text()),
             'xmax':               self._parse(self._xmax.text()),
             'ymin':               self._parse(self._ymin.text()),
@@ -968,16 +1170,37 @@ class PlotConfigDialog(QDialog):
         }
 
     def result_assigned(self) -> List[dict]:
-        """Return the assigned list with updated transform expressions."""
+        """Return the (possibly reduced) assigned list with updated transform
+        expressions, reflecting any channels removed via the Remove button."""
         updated = []
-        for i, ch in enumerate(self._assigned):
+        for i, ch in enumerate(self._current_assigned):
             ch_copy = dict(ch)
-            if i < self._xfm_table.rowCount():
-                item = self._xfm_table.item(i, 1)
-                expr = item.text().strip() if item else ''
-                ch_copy['transform'] = expr if expr else 'y'
+            item = self._xfm_table.item(i, 1)
+            expr = item.text().strip() if item else ''
+            ch_copy['transform'] = expr if expr else 'y'
             updated.append(ch_copy)
         return updated
+
+    def _rebuild_xfm_table(self):
+        self._xfm_table.setRowCount(len(self._current_assigned))
+        self._xfm_table.setMinimumHeight(min(len(self._current_assigned) * 28 + 28, 180))
+        for i, ch in enumerate(self._current_assigned):
+            name_item = QTableWidgetItem(f"[{ch['source']}]  {ch['name']}")
+            name_item.setFlags(Qt.ItemIsEnabled)   # read-only
+            expr_item = QTableWidgetItem(ch.get('transform', 'y'))
+            self._xfm_table.setItem(i, 0, name_item)
+            self._xfm_table.setItem(i, 1, expr_item)
+            rm_btn = QPushButton("✕")
+            rm_btn.setFixedWidth(24)
+            rm_btn.setToolTip("Remove this channel from the plot")
+            rm_btn.clicked.connect(lambda _checked, idx=i: self._remove_channel(idx))
+            self._xfm_table.setCellWidget(i, 2, rm_btn)
+        self._xfm_table_row.setVisible(bool(self._current_assigned))
+        self._xfm_table.setVisible(bool(self._current_assigned))
+
+    def _remove_channel(self, idx: int):
+        del self._current_assigned[idx]
+        self._rebuild_xfm_table()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1010,9 +1233,7 @@ class PlotWidget(QFrame):
             'analysis_enabled': False, 'analysis_source': 'Both', 'analysis_settle_pct': 2.0,
         }
         self.assigned: List[dict] = []
-        self._psse_ds:   Optional[PSSEDataset]  = None
-        self._pscad_src: Optional[PSCADFolder]  = None
-        self._field_ds:  Optional[FieldDataset] = None
+        self._registry: Optional[DatasetRegistry] = None
         self._time_offset: float = 0.0
         self._global_xmin: Optional[float] = None
         self._global_xmax: Optional[float] = None
@@ -1105,13 +1326,8 @@ class PlotWidget(QFrame):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def set_datasets(self, psse: Optional[PSSEDataset],
-                     pscad: Optional[PSCADFolder]):
-        self._psse_ds, self._pscad_src = psse, pscad
-        self.refresh()
-
-    def set_field_ds(self, ds: Optional['FieldDataset']):
-        self._field_ds = ds
+    def set_registry(self, registry: Optional['DatasetRegistry']):
+        self._registry = registry
         self.refresh()
 
     def set_time_offset(self, offset: float):
@@ -1145,6 +1361,7 @@ class PlotWidget(QFrame):
         self.ax.yaxis.get_major_formatter().set_scientific(False)
         self._lines = []
         errors = []
+        seen_sources: set = set()
 
         cfg = self.plot_config
         bands_on  = cfg.get('bands_enabled', False)
@@ -1163,9 +1380,7 @@ class PlotWidget(QFrame):
                              'exp': np.exp, 'sin': np.sin, 'cos': np.cos,
                              'pi': np.pi, '__builtins__': {}}
                     y = eval(transform, _safe)   # noqa: S307 – user-controlled expression
-                label = f"{ch['name']}_{ch['source']}"
-                if ch.get('units'):
-                    label += f"  [{ch['units']}]"
+                label = _channel_legend_label(ch, cfg, seen_sources)
                 line, = self.ax.plot(t, y, color=color, linewidth=1.1, label=label)
                 self._lines.append(line)
                 # ±10 % bands
@@ -1273,18 +1488,11 @@ class PlotWidget(QFrame):
             _autoscale_y_to_xlim(self.ax, self._lines)
 
     def _fetch(self, ch: dict) -> Tuple[np.ndarray, np.ndarray]:
-        if ch['source'] == 'PSSE':
-            if self._psse_ds is None:
-                raise RuntimeError("No PSSE dataset loaded")
-            return self._psse_ds.get(ch['name'])
-        elif ch['source'] == 'Field':
-            if self._field_ds is None:
-                raise RuntimeError("No field data loaded")
-            return self._field_ds.get(ch['name'])
-        else:
-            if self._pscad_src is None:
-                raise RuntimeError("No PSCAD dataset loaded")
-            return self._pscad_src.get(ch['name'])
+        entry = _resolve_dataset(self._registry, ch)
+        if entry is None:
+            raise RuntimeError(
+                f"Dataset {ch.get('dataset_id') or ch['source']} not loaded")
+        return entry.active_source().get(ch['name'])
 
     def _draw_placeholder(self):
         self.ax.set_xlim(0, 1); self.ax.set_ylim(0, 1)
@@ -1449,9 +1657,8 @@ class PlotGrid(QWidget):
         self._plots: List[List[PlotWidget]] = []
         self._grid_layout = QGridLayout(self)
         self._grid_layout.setSpacing(4)
-        self._psse_ds:    Optional[PSSEDataset]  = None
-        self._pscad_src:  Optional[PSCADFolder]  = None
-        self._field_ds:   Optional[FieldDataset] = None
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._registry: Optional[DatasetRegistry] = None
         self._time_offset = 0.0
         self._global_xmin: Optional[float] = None
         self._global_xmax: Optional[float] = None
@@ -1479,29 +1686,37 @@ class PlotGrid(QWidget):
             row = []
             for c in range(self._cols):
                 pw = PlotWidget(r, c)
-                pw.set_datasets(self._psse_ds, self._pscad_src)
-                pw.set_field_ds(self._field_ds)
+                pw.set_registry(self._registry)
                 pw.set_time_offset(self._time_offset)
                 pw.set_global_xlim(self._global_xmin, self._global_xmax)
                 self._grid_layout.addWidget(pw, r, c)
                 row.append(pw)
             self._plots.append(row)
+        # Equal stretch on every row/col so a single panel's content
+        # (e.g. a legend appearing after a drop) can't resize the grid.
+        # Stretch factors on QGridLayout persist per-index even after a
+        # row/col's widgets are removed, so clear stale ones (up to the
+        # spinbox max) before setting the ones actually in use.
+        for r in range(10):
+            self._grid_layout.setRowStretch(r, 1 if r < self._rows else 0)
+        for c in range(10):
+            self._grid_layout.setColumnStretch(c, 1 if c < self._cols else 0)
+        self._grid_layout.activate()
+        self.updateGeometry()
 
     def _flat(self) -> List[PlotWidget]:
         return [pw for row in self._plots for pw in row]
 
     # ── Dataset / offset propagation ─────────────────────────────────────────
 
-    def set_datasets(self, psse: Optional[PSSEDataset],
-                     pscad: Optional[PSCADFolder]):
-        self._psse_ds, self._pscad_src = psse, pscad
+    def set_registry(self, registry: Optional[DatasetRegistry]):
+        self._registry = registry
         for pw in self._flat():
-            pw.set_datasets(psse, pscad)
+            pw.set_registry(registry)
 
-    def set_field_ds(self, ds: Optional[FieldDataset]):
-        self._field_ds = ds
+    def refresh_all(self):
         for pw in self._flat():
-            pw.set_field_ds(ds)
+            pw.refresh()
 
     def set_time_offset(self, offset: float):
         self._time_offset = offset
@@ -1527,14 +1742,13 @@ class PlotGrid(QWidget):
 
     def render_page(
         self,
-        psse_ds:     Optional[PSSEDataset],
-        pscad_ds:    Optional[PSCADFolder],
+        registry:    Optional[DatasetRegistry],
         time_offset: float,
         layout:      dict,
         page_title:  str = '',
         global_xmin: Optional[float] = None,
         global_xmax: Optional[float] = None,
-        field_ds:    Optional[FieldDataset] = None,
+        page_size:   Optional[Tuple[float, float]] = None,
     ) -> Figure:
         rows   = layout.get('rows', self._rows)
         cols   = layout.get('cols', self._cols)
@@ -1543,7 +1757,8 @@ class PlotGrid(QWidget):
         # interactive Qt5Agg backend — creating/destroying Qt5Agg figures
         # from inside a button click reenters the running QApplication's
         # Qt event loop and can crash the app (Qt5Core stack corruption).
-        fig = Figure(figsize=(cols * 5.0, rows * 3.5), tight_layout=True)
+        figsize = page_size if page_size is not None else (cols * 5.0, rows * 3.5)
+        fig = Figure(figsize=figsize, tight_layout=True)
         FigureCanvasAgg(fig)
         axes = fig.subplots(rows, cols)
         # Normalise axes array to 2-D
@@ -1560,22 +1775,16 @@ class PlotGrid(QWidget):
             bands_on  = cfg.get('bands_enabled', False)
             bands_src = cfg.get('bands_source', 'PSCAD')
             plotted   = []   # (ch, t, y, color) for analysis
+            seen_sources: set = set()
             for ci, ch in enumerate(assigned):
                 color = LINE_COLORS[ci % len(LINE_COLORS)]
                 try:
+                    entry = _resolve_dataset(registry, ch)
+                    if entry is None:
+                        continue
+                    t, y = entry.active_source().get(ch['name'])
                     if ch['source'] == 'PSSE':
-                        if psse_ds is None:
-                            continue
-                        t, y = psse_ds.get(ch['name'])
                         t = t + time_offset
-                    elif ch['source'] == 'Field':
-                        if field_ds is None:
-                            continue
-                        t, y = field_ds.get(ch['name'])
-                    else:
-                        if pscad_ds is None:
-                            continue
-                        t, y = pscad_ds.get(ch['name'])
                     transform = ch.get('transform', 'y')
                     if transform.strip() not in ('y', ''):
                         _safe = {'y': y, 't': t, 'np': np,
@@ -1583,9 +1792,7 @@ class PlotGrid(QWidget):
                                  'exp': np.exp, 'sin': np.sin, 'cos': np.cos,
                                  'pi': np.pi, '__builtins__': {}}
                         y = eval(transform, _safe)   # noqa: S307
-                    label = f"{ch['name']}_{ch['source']}"
-                    if ch.get('units'):
-                        label += f"  [{ch['units']}]"
+                    label = _channel_legend_label(ch, cfg, seen_sources)
                     ax.plot(t, y, color=color, linewidth=1.0, label=label)
                     plotted.append((ch, t, y, color))
                     if bands_on and (bands_src == 'Both' or ch['source'] == bands_src):
@@ -1668,25 +1875,25 @@ class ExportDialog(QDialog):
     # Default location to look for the title xlsx
     _DEFAULT_XLSX_DIR = r"C:\Users\CamSmith\Documents\Claude Working Folder\Benchmarking Tool"
 
-    def __init__(self, psse_dir: str, pscad_dir: str, parent=None):
+    def __init__(self, registry: 'DatasetRegistry', parent=None):
         super().__init__(parent)
         self.setWindowTitle("Export Results")
         self.setMinimumWidth(560)
         layout = QFormLayout(self)
         layout.setSpacing(8)
 
-        # PSSE folder
-        self._psse_edit = QLineEdit(psse_dir)
+        # PSSE folder — populated from loaded datasets, Browse to override
+        self._psse_combo = self._make_ds_combo(registry, 'PSSE')
         btn_p = QPushButton("Browse…")
-        btn_p.clicked.connect(lambda: self._pick_dir(self._psse_edit))
-        h1 = QHBoxLayout(); h1.addWidget(self._psse_edit); h1.addWidget(btn_p)
+        btn_p.clicked.connect(lambda: self._pick_combo_dir(self._psse_combo))
+        h1 = QHBoxLayout(); h1.addWidget(self._psse_combo, 1); h1.addWidget(btn_p)
         layout.addRow("PSSE folder:", h1)
 
         # PSCAD folder
-        self._pscad_edit = QLineEdit(pscad_dir)
+        self._pscad_combo = self._make_ds_combo(registry, 'PSCAD')
         btn_q = QPushButton("Browse…")
-        btn_q.clicked.connect(lambda: self._pick_dir(self._pscad_edit))
-        h2 = QHBoxLayout(); h2.addWidget(self._pscad_edit); h2.addWidget(btn_q)
+        btn_q.clicked.connect(lambda: self._pick_combo_dir(self._pscad_combo))
+        h2 = QHBoxLayout(); h2.addWidget(self._pscad_combo, 1); h2.addWidget(btn_q)
         layout.addRow("PSCAD folder:", h2)
 
         # Output folder
@@ -1707,6 +1914,11 @@ class ExportDialog(QDialog):
         ])
         self._fmt.currentIndexChanged.connect(self._on_fmt_changed)
         layout.addRow("Output format:", self._fmt)
+
+        # Page size
+        self._page_size = QComboBox()
+        self._page_size.addItems(list(PAGE_SIZES.keys()))
+        layout.addRow("Page size:", self._page_size)
 
         # Single-page filename
         self._single_name_edit = QLineEdit("BOPPO_export")
@@ -1808,10 +2020,22 @@ class ExportDialog(QDialog):
             pass
         return ''
 
-    def _pick_dir(self, edit: QLineEdit):
-        folder = QFileDialog.getExistingDirectory(self, "Select folder", edit.text())
+    @staticmethod
+    def _make_ds_combo(registry, kind) -> QComboBox:
+        combo = QComboBox()
+        if registry is not None:
+            for d in registry.all_of_kind(kind):
+                combo.addItem(d.label, d.path)
+        if combo.count() == 0:
+            combo.addItem("(none loaded)", '')
+        return combo
+
+    def _pick_combo_dir(self, combo: QComboBox):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select folder", combo.currentData() or '')
         if folder:
-            edit.setText(folder)
+            combo.addItem(folder, folder)
+            combo.setCurrentIndex(combo.count() - 1)
 
     def _pick_out(self):
         folder = QFileDialog.getExistingDirectory(self, "Select output folder")
@@ -1829,10 +2053,11 @@ class ExportDialog(QDialog):
 
     def params(self) -> dict:
         return {
-            'psse_folder':    self._psse_edit.text().strip(),
-            'pscad_folder':   self._pscad_edit.text().strip(),
+            'psse_folder':    (self._psse_combo.currentData() or '').strip(),
+            'pscad_folder':   (self._pscad_combo.currentData() or '').strip(),
             'out_folder':     self._out_edit.text().strip(),
             'format':         self._fmt.currentText(),
+            'page_size':      PAGE_SIZES.get(self._page_size.currentText()),
             'single_page':    self._fmt.currentText().startswith('Current screen'),
             'single_name':    self._single_name_edit.text().strip() or 'BOPPO_export',
             'loop_psse':      self._loop_combo.currentIndex() == 0,
@@ -1848,79 +2073,84 @@ class ExportDialog(QDialog):
 # MAIN WINDOW
 # ══════════════════════════════════════════════════════════════════════════════
 
-class MainWindow(QMainWindow):
+class ComparisonTabController(QWidget):
+    """One benchmarking tab: multiple PSSE/PSCAD (and optionally Field) datasets
+    plotted together on a shared grid. Parameterised by `formats` so a single
+    class serves both the 'PSSE vs PSCAD' and 'Field Data Overlay' tabs."""
 
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("BOPPO – Benchmarking Of PSSE and PSCAD Outputs")
-        self.resize(1440, 900)
+    _KIND_LABELS = {'PSSE': 'PSSE folder', 'PSCAD': 'PSCAD folder',
+                    'Field': 'Field Data (CSV/XLSX)'}
 
-        self._psse_folder:  Optional[PSSEFolder]  = None
-        self._pscad_folder: Optional[PSCADFolder] = None
-
-        # Tab 2 state
-        self._t2_psse_folder:  Optional[PSSEFolder]  = None
-        self._t2_pscad_folder: Optional[PSCADFolder] = None
-        self._t2_field_ds:     Optional[FieldDataset] = None
-
-        self._build_ui()
-        self._build_menu()
-        self.statusBar().showMessage(
-            "Load a PSSE folder and a PSCAD folder, then drag channels onto plots."
-        )
+    def __init__(self, formats: List[str], statusbar=None, parent=None):
+        super().__init__(parent)
+        self.formats = formats
+        self._statusbar = statusbar
+        self.registry = DatasetRegistry()
+        self._build()
+        self.plot_grid.set_registry(self.registry)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
-    def _build_ui(self):
-        tabs = QTabWidget()
-        self.setCentralWidget(tabs)
-        tabs.addTab(self._build_comparison_tab(), "PSSE vs PSCAD")
-        tabs.addTab(self._build_field_tab(),      "Field Data Overlay")
+    def _make_xlim_edit(self, placeholder: str) -> QLineEdit:
+        w = QLineEdit()
+        w.setPlaceholderText(placeholder)
+        w.setFixedWidth(72)
+        w.setToolTip("Global x-axis limit applied to all plots (leave blank for auto)")
+        return w
 
-    def _build_comparison_tab(self) -> QWidget:
+    def _build(self):
         splitter = QSplitter(Qt.Horizontal)
 
         # ── Left panel ────────────────────────────────────────────────────────
         left = QWidget()
-        left.setMaximumWidth(300)
-        left.setMinimumWidth(200)
+        left.setMaximumWidth(320)
+        left.setMinimumWidth(220)
         lv = QVBoxLayout(left)
         lv.setContentsMargins(6, 6, 6, 6)
         lv.setSpacing(6)
 
-        psse_btn = QPushButton("⬇  Load PSSE folder…")
-        psse_btn.setStyleSheet(
-            f"color: white; background: {PSSE_COLOR}; font-weight: bold; padding: 5px;"
-        )
-        psse_btn.clicked.connect(self._load_psse)
-        lv.addWidget(psse_btn)
+        for kind in self.formats:
+            btn = QPushButton(f"⬇  Load {self._KIND_LABELS[kind]}…")
+            btn.setStyleSheet(
+                f"color: white; background: {KIND_COLOR[kind]}; "
+                "font-weight: bold; padding: 5px;"
+            )
+            btn.clicked.connect(lambda _c=False, k=kind: self._load_folder(k))
+            lv.addWidget(btn)
 
-        pscad_btn = QPushButton("⬇  Load PSCAD folder…")
-        pscad_btn.setStyleSheet(
-            f"color: white; background: {PSCAD_COLOR}; font-weight: bold; padding: 5px;"
-        )
-        pscad_btn.clicked.connect(self._load_pscad)
-        lv.addWidget(pscad_btn)
+        # Loaded datasets list + remove button
+        lv.addWidget(QLabel("Loaded datasets:"))
+        self.ds_list = QListWidget()
+        self.ds_list.setMaximumHeight(120)
+        self.ds_list.currentItemChanged.connect(self._on_ds_selected)
+        lv.addWidget(self.ds_list)
 
-        # Dataset selectors
-        ds_form = QFormLayout()
-        self._psse_sel  = QComboBox()
-        self._pscad_sel = QComboBox()
-        self._psse_sel.currentIndexChanged.connect(self._on_psse_sel_changed)
-        self._pscad_sel.currentIndexChanged.connect(self._on_pscad_sel_changed)
-        ds_form.addRow("Preview PSSE:", self._psse_sel)
-        ds_form.addRow("Preview PSCAD:", self._pscad_sel)
-        lv.addLayout(ds_form)
+        ds_btns = QHBoxLayout()
+        remove_btn = QPushButton("✕  Remove")
+        remove_btn.setToolTip("Unload the selected dataset")
+        remove_btn.clicked.connect(self._remove_selected_dataset)
+        ds_btns.addWidget(remove_btn)
+        ds_btns.addStretch()
+        lv.addLayout(ds_btns)
+
+        # Sub-dataset selector for the highlighted dataset
+        subds_form = QFormLayout()
+        self.subds_combo = QComboBox()
+        self.subds_combo.setToolTip(
+            "Which internal result file is active for the selected dataset")
+        self.subds_combo.currentIndexChanged.connect(self._on_subds_changed)
+        subds_form.addRow("Active file:", self.subds_combo)
+        lv.addLayout(subds_form)
 
         # Search
-        self._search = QLineEdit()
-        self._search.setPlaceholderText("🔍  Filter channels…")
-        self._search.textChanged.connect(self._on_search)
-        lv.addWidget(self._search)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("🔍  Filter channels…")
+        self.search.textChanged.connect(self._on_search)
+        lv.addWidget(self.search)
 
         # Channel tree
-        self._channel_browser = ChannelBrowser()
-        lv.addWidget(self._channel_browser, 1)
+        self.browser = ChannelBrowser()
+        lv.addWidget(self.browser, 1)
 
         splitter.addWidget(left)
 
@@ -1930,21 +2160,20 @@ class MainWindow(QMainWindow):
         rv.setContentsMargins(4, 4, 4, 4)
         rv.setSpacing(6)
 
-        # Toolbar row
         toolbar = QHBoxLayout()
 
         toolbar.addWidget(QLabel("Grid:"))
-        self._rows_spin = QSpinBox()
-        self._rows_spin.setRange(1, 10)
-        self._rows_spin.setValue(2)
-        self._rows_spin.setFixedWidth(50)
-        toolbar.addWidget(self._rows_spin)
+        self.rows_spin = QSpinBox()
+        self.rows_spin.setRange(1, 10)
+        self.rows_spin.setValue(2)
+        self.rows_spin.setFixedWidth(50)
+        toolbar.addWidget(self.rows_spin)
         toolbar.addWidget(QLabel("×"))
-        self._cols_spin = QSpinBox()
-        self._cols_spin.setRange(1, 10)
-        self._cols_spin.setValue(3)
-        self._cols_spin.setFixedWidth(50)
-        toolbar.addWidget(self._cols_spin)
+        self.cols_spin = QSpinBox()
+        self.cols_spin.setRange(1, 10)
+        self.cols_spin.setValue(3)
+        self.cols_spin.setFixedWidth(50)
+        toolbar.addWidget(self.cols_spin)
         apply_btn = QPushButton("Apply")
         apply_btn.setFixedWidth(60)
         apply_btn.clicked.connect(self._apply_grid)
@@ -1952,34 +2181,26 @@ class MainWindow(QMainWindow):
 
         toolbar.addSpacing(24)
         toolbar.addWidget(QLabel("PSSE time offset (s):"))
-        self._offset_spin = QDoubleSpinBox()
-        self._offset_spin.setRange(-99999, 99999)
-        self._offset_spin.setSingleStep(0.01)
-        self._offset_spin.setDecimals(4)
-        self._offset_spin.setValue(0.0)
-        self._offset_spin.setFixedWidth(100)
-        self._offset_spin.setToolTip(
+        self.offset_spin = QDoubleSpinBox()
+        self.offset_spin.setRange(-99999, 99999)
+        self.offset_spin.setSingleStep(0.01)
+        self.offset_spin.setDecimals(4)
+        self.offset_spin.setValue(0.0)
+        self.offset_spin.setFixedWidth(100)
+        self.offset_spin.setToolTip(
             "Shift the PSSE time axis by this value (seconds).\n"
             "Positive = PSSE data shifted later."
         )
-        self._offset_spin.valueChanged.connect(self._on_offset_changed)
-        toolbar.addWidget(self._offset_spin)
+        self.offset_spin.valueChanged.connect(self._on_offset_changed)
+        toolbar.addWidget(self.offset_spin)
 
         toolbar.addSpacing(24)
         toolbar.addWidget(QLabel("X limits:"))
-
-        def _xlim_edit(placeholder):
-            w = QLineEdit()
-            w.setPlaceholderText(placeholder)
-            w.setFixedWidth(72)
-            w.setToolTip("Global x-axis limit applied to all plots (leave blank for auto)")
-            return w
-
-        self._gxmin_edit = _xlim_edit("min")
-        self._gxmax_edit = _xlim_edit("max")
-        toolbar.addWidget(self._gxmin_edit)
+        self.gxmin_edit = self._make_xlim_edit("min")
+        self.gxmax_edit = self._make_xlim_edit("max")
+        toolbar.addWidget(self.gxmin_edit)
         toolbar.addWidget(QLabel("–"))
-        toolbar.addWidget(self._gxmax_edit)
+        toolbar.addWidget(self.gxmax_edit)
 
         apply_xlim_btn = QPushButton("Apply")
         apply_xlim_btn.setFixedWidth(52)
@@ -1996,6 +2217,11 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(load_tpl_btn)
 
         toolbar.addStretch()
+        toolbar.addWidget(QLabel("Page size:"))
+        self.page_size_combo = QComboBox()
+        self.page_size_combo.addItems(list(PAGE_SIZES.keys()))
+        self.page_size_combo.setToolTip("Page size used by the Export PDF button")
+        toolbar.addWidget(self.page_size_combo)
         export_pdf_btn = QPushButton("📄  Export PDF")
         export_pdf_btn.clicked.connect(self._export_current_pdf)
         toolbar.addWidget(export_pdf_btn)
@@ -2008,266 +2234,133 @@ class MainWindow(QMainWindow):
         # Scrollable plot grid
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        self._plot_grid = PlotGrid()
-        scroll.setWidget(self._plot_grid)
+        self.plot_grid = PlotGrid()
+        scroll.setWidget(self.plot_grid)
         rv.addWidget(scroll, 1)
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        return splitter
 
-    # ── Field Data tab ────────────────────────────────────────────────────────
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(splitter)
 
-    def _build_field_tab(self) -> QWidget:
-        splitter = QSplitter(Qt.Horizontal)
+    # ── Dataset list helpers ──────────────────────────────────────────────────
 
-        # ── Left panel ────────────────────────────────────────────────────────
-        left = QWidget()
-        left.setMaximumWidth(300)
-        left.setMinimumWidth(200)
-        lv = QVBoxLayout(left)
-        lv.setContentsMargins(6, 6, 6, 6)
-        lv.setSpacing(6)
+    def _refresh_ds_list(self):
+        self.ds_list.blockSignals(True)
+        self.ds_list.clear()
+        for d in self.registry.all():
+            item = QListWidgetItem(f"[{d.kind}]  {d.label}")
+            item.setData(Qt.UserRole, d.id)
+            item.setForeground(QColor(KIND_COLOR[d.kind]))
+            self.ds_list.addItem(item)
+        self.ds_list.blockSignals(False)
+        self._on_ds_selected(self.ds_list.currentItem(), None)
 
-        psse_btn = QPushButton("⬇  Load PSSE folder…")
-        psse_btn.setStyleSheet(
-            f"color: white; background: {PSSE_COLOR}; font-weight: bold; padding: 5px;"
-        )
-        psse_btn.clicked.connect(self._t2_load_psse)
-        lv.addWidget(psse_btn)
+    def _on_ds_selected(self, current, _previous=None):
+        self.subds_combo.blockSignals(True)
+        self.subds_combo.clear()
+        entry = self.registry.get(current.data(Qt.UserRole)) if current else None
+        if entry is not None:
+            ds_list = getattr(entry.folder_obj, 'datasets', None)
+            if ds_list:
+                for ds in ds_list:
+                    self.subds_combo.addItem(ds.name)
+                self.subds_combo.setCurrentIndex(
+                    min(entry.sel_index, len(ds_list) - 1))
+        self.subds_combo.setEnabled(self.subds_combo.count() > 0)
+        self.subds_combo.blockSignals(False)
 
-        pscad_btn = QPushButton("⬇  Load PSCAD folder…")
-        pscad_btn.setStyleSheet(
-            f"color: white; background: {PSCAD_COLOR}; font-weight: bold; padding: 5px;"
-        )
-        pscad_btn.clicked.connect(self._t2_load_pscad)
-        lv.addWidget(pscad_btn)
-
-        field_btn = QPushButton("⬇  Load Field Data (CSV/XLSX)…")
-        field_btn.setStyleSheet(
-            f"color: white; background: {FIELD_COLOR}; font-weight: bold; padding: 5px;"
-        )
-        field_btn.clicked.connect(self._t2_load_field)
-        lv.addWidget(field_btn)
-
-        self._t2_field_label = QLabel("No field data loaded")
-        self._t2_field_label.setStyleSheet("color: #888; font-size: 9px;")
-        self._t2_field_label.setWordWrap(True)
-        lv.addWidget(self._t2_field_label)
-
-        # Dataset selectors
-        ds_form = QFormLayout()
-        self._t2_psse_sel  = QComboBox()
-        self._t2_pscad_sel = QComboBox()
-        self._t2_psse_sel.currentIndexChanged.connect(self._t2_on_psse_sel_changed)
-        self._t2_pscad_sel.currentIndexChanged.connect(self._t2_on_pscad_sel_changed)
-        ds_form.addRow("Preview PSSE:",  self._t2_psse_sel)
-        ds_form.addRow("Preview PSCAD:", self._t2_pscad_sel)
-        lv.addLayout(ds_form)
-
-        self._t2_search = QLineEdit()
-        self._t2_search.setPlaceholderText("🔍  Filter channels…")
-        self._t2_search.textChanged.connect(self._t2_on_search)
-        lv.addWidget(self._t2_search)
-
-        self._t2_browser = ChannelBrowser()
-        lv.addWidget(self._t2_browser, 1)
-
-        splitter.addWidget(left)
-
-        # ── Right panel ───────────────────────────────────────────────────────
-        right = QWidget()
-        rv = QVBoxLayout(right)
-        rv.setContentsMargins(4, 4, 4, 4)
-        rv.setSpacing(6)
-
-        toolbar = QHBoxLayout()
-
-        toolbar.addWidget(QLabel("Grid:"))
-        self._t2_rows_spin = QSpinBox()
-        self._t2_rows_spin.setRange(1, 10)
-        self._t2_rows_spin.setValue(2)
-        self._t2_rows_spin.setFixedWidth(50)
-        toolbar.addWidget(self._t2_rows_spin)
-        toolbar.addWidget(QLabel("×"))
-        self._t2_cols_spin = QSpinBox()
-        self._t2_cols_spin.setRange(1, 10)
-        self._t2_cols_spin.setValue(3)
-        self._t2_cols_spin.setFixedWidth(50)
-        toolbar.addWidget(self._t2_cols_spin)
-        apply_btn = QPushButton("Apply")
-        apply_btn.setFixedWidth(60)
-        apply_btn.clicked.connect(self._t2_apply_grid)
-        toolbar.addWidget(apply_btn)
-
-        toolbar.addSpacing(24)
-        toolbar.addWidget(QLabel("PSSE time offset (s):"))
-        self._t2_offset_spin = QDoubleSpinBox()
-        self._t2_offset_spin.setRange(-99999, 99999)
-        self._t2_offset_spin.setSingleStep(0.01)
-        self._t2_offset_spin.setDecimals(4)
-        self._t2_offset_spin.setValue(0.0)
-        self._t2_offset_spin.setFixedWidth(100)
-        self._t2_offset_spin.valueChanged.connect(self._t2_on_offset_changed)
-        toolbar.addWidget(self._t2_offset_spin)
-
-        toolbar.addSpacing(24)
-        toolbar.addWidget(QLabel("X limits:"))
-
-        def _xlim_edit(ph):
-            w = QLineEdit()
-            w.setPlaceholderText(ph)
-            w.setFixedWidth(72)
-            return w
-
-        self._t2_gxmin_edit = _xlim_edit("min")
-        self._t2_gxmax_edit = _xlim_edit("max")
-        toolbar.addWidget(self._t2_gxmin_edit)
-        toolbar.addWidget(QLabel("–"))
-        toolbar.addWidget(self._t2_gxmax_edit)
-        apply_xlim_btn = QPushButton("Apply")
-        apply_xlim_btn.setFixedWidth(52)
-        apply_xlim_btn.clicked.connect(self._t2_on_global_xlim_changed)
-        toolbar.addWidget(apply_xlim_btn)
-
-        toolbar.addSpacing(24)
-        save_tpl_btn = QPushButton("💾  Save Template")
-        save_tpl_btn.clicked.connect(self._t2_save_template)
-        toolbar.addWidget(save_tpl_btn)
-        load_tpl_btn = QPushButton("📂  Load Template")
-        load_tpl_btn.clicked.connect(self._t2_load_template)
-        toolbar.addWidget(load_tpl_btn)
-
-        toolbar.addStretch()
-        export_btn = QPushButton("📄  Export All…")
-        export_btn.setStyleSheet("font-weight: bold; padding: 5px 16px;")
-        export_btn.clicked.connect(self._t2_export)
-        toolbar.addWidget(export_btn)
-        rv.addLayout(toolbar)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        self._t2_plot_grid = PlotGrid()
-        scroll.setWidget(self._t2_plot_grid)
-        rv.addWidget(scroll, 1)
-
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        return splitter
-
-    def _build_menu(self):
-        mb = self.menuBar()
-        fm = mb.addMenu("&File")
-        fm.addAction("Load PSSE folder…",  self._load_psse,  "Ctrl+Shift+P")
-        fm.addAction("Load PSCAD folder…", self._load_pscad, "Ctrl+Shift+C")
-        fm.addSeparator()
-        fm.addAction("Export All…", self._export, "Ctrl+E")
-        fm.addSeparator()
-        fm.addAction("Quit", self.close, "Ctrl+Q")
-
-        hm = mb.addMenu("&Help")
-        hm.addAction("About BOPPO", self._about)
+    def _on_subds_changed(self, idx: int):
+        item = self.ds_list.currentItem()
+        entry = self.registry.get(item.data(Qt.UserRole)) if item else None
+        if entry is not None and idx >= 0:
+            entry.sel_index = idx
+            self.plot_grid.refresh_all()
 
     # ── Load handlers ─────────────────────────────────────────────────────────
 
-    def _load_psse(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select PSS/E results folder"
-        )
-        if not folder:
-            return
-        try:
-            self._psse_folder = PSSEFolder(folder)
-        except Exception as ex:
-            QMessageBox.critical(self, "Load Error", f"PSSE:\n{ex}")
-            return
-
-        self._psse_sel.blockSignals(True)
-        self._psse_sel.clear()
-        for ds in self._psse_folder.datasets:
-            self._psse_sel.addItem(ds.name)
-        self._psse_sel.blockSignals(False)
-
-        try:
-            names = self._psse_folder.channel_names()
-            self._channel_browser.set_psse_channels(names)
-            self.statusBar().showMessage(
-                f"PSSE: {len(self._psse_folder.datasets)} file(s), {len(names)} channels  ·  "
-                + self.statusBar().currentMessage().split("·")[-1].strip()
+    def _load_folder(self, kind: str):
+        if kind == 'Field':
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select field data file", "",
+                "Field Data (*.csv *.xlsx);;All files (*)"
             )
-        except Exception as ex:
-            QMessageBox.warning(
-                self, "PSSE Channel Warning",
-                f"Could not read channel names:\n{ex}\n\n"
-                "You can still configure plots, but data will load on first use."
-            )
-
-        self._refresh_preview_datasets()
-
-    def _load_pscad(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select PSCAD results folder"
-        )
-        if not folder:
+        else:
+            path = QFileDialog.getExistingDirectory(
+                self, f"Select {kind} results folder")
+        if not path:
             return
         try:
-            if list(Path(folder).glob('*.psout')):
-                self._pscad_folder = PSCADPsoutFolder(folder)
+            if kind == 'PSSE':
+                ds_id = self.registry.add_psse(path)
+            elif kind == 'PSCAD':
+                ds_id = self.registry.add_pscad(path)
             else:
-                self._pscad_folder = PSCADFolder(folder)
+                ds_id = self.registry.add_field(path)
         except Exception as ex:
-            QMessageBox.critical(self, "Load Error", f"PSCAD:\n{ex}")
+            QMessageBox.critical(self, "Load Error", f"{kind}:\n{ex}")
             return
+        self._populate_browser_for(ds_id)
+        self._refresh_ds_list()
+        self.plot_grid.refresh_all()
+        self._update_status()
 
-        self._pscad_sel.blockSignals(True)
-        self._pscad_sel.clear()
-        for ds in self._pscad_folder.datasets:
-            self._pscad_sel.addItem(ds.name)
-        self._pscad_sel.blockSignals(False)
+    def _populate_browser_for(self, ds_id: str):
+        entry = self.registry.get(ds_id)
+        if entry is None:
+            return
+        folder = entry.folder_obj
+        if entry.kind == 'PSSE':
+            try:
+                names = folder.channel_names()
+            except Exception as ex:
+                QMessageBox.warning(
+                    self, "PSSE Channel Warning",
+                    f"Could not read channel names:\n{ex}\n\n"
+                    "You can still configure plots, but data will load on first use."
+                )
+                names = []
+            self.browser.set_dataset_channels('PSSE', ds_id, entry.label, names)
+        elif entry.kind == 'PSCAD':
+            names = folder.channel_names()
+            self.browser.set_dataset_channels(
+                'PSCAD', ds_id, entry.label, names,
+                units_fn=folder.channel_units)
+        else:
+            names = folder.channels
+            self.browser.set_dataset_channels('Field', ds_id, entry.label, names)
 
-        names = self._pscad_folder.channel_names()
-        self._channel_browser.set_pscad_channels(
-            names, units_fn=self._pscad_folder.channel_units
-        )
-        self.statusBar().showMessage(
-            self.statusBar().currentMessage().split("·")[0].strip()
-            + f"  ·  PSCAD: {len(names)} channels"
-        )
-        self._refresh_preview_datasets()
+    def _remove_selected_dataset(self):
+        item = self.ds_list.currentItem()
+        if item is None:
+            return
+        ds_id = item.data(Qt.UserRole)
+        entry = self.registry.get(ds_id)
+        if entry is not None:
+            self.browser.remove_dataset(entry.kind, ds_id)
+        self.registry.remove(ds_id)
+        self._refresh_ds_list()
+        self.plot_grid.refresh_all()
+        self._update_status()
 
-    def _on_psse_sel_changed(self, idx: int):
-        self._refresh_preview_datasets()
-
-    def _on_pscad_sel_changed(self, idx: int):
-        self._refresh_preview_datasets()
-
-    def _refresh_preview_datasets(self):
-        psse_ds = (
-            self._psse_folder.datasets[self._psse_sel.currentIndex()]
-            if self._psse_folder and self._psse_folder.datasets
-            and 0 <= self._psse_sel.currentIndex() < len(self._psse_folder.datasets)
-            else None
-        )
-        pscad_idx = self._pscad_sel.currentIndex()
-        pscad_src = (
-            self._pscad_folder.datasets[pscad_idx]
-            if self._pscad_folder and self._pscad_folder.datasets
-            and 0 <= pscad_idx < len(self._pscad_folder.datasets)
-            else self._pscad_folder
-        )
-        self._plot_grid.set_datasets(psse_ds, pscad_src)
+    def _update_status(self):
+        if self._statusbar is None:
+            return
+        counts = {k: len(self.registry.all_of_kind(k))
+                  for k in ('PSSE', 'PSCAD', 'Field')}
+        parts = [f"{k}: {counts[k]}" for k in self.formats]
+        self._statusbar.showMessage("Loaded datasets  ·  " + "  ·  ".join(parts))
 
     # ── Grid / offset ─────────────────────────────────────────────────────────
 
     def _apply_grid(self):
-        self._plot_grid.set_grid(
-            self._rows_spin.value(), self._cols_spin.value()
-        )
+        self.plot_grid.set_grid(self.rows_spin.value(), self.cols_spin.value())
 
     def _on_offset_changed(self, val: float):
-        self._plot_grid.set_time_offset(val)
+        self.plot_grid.set_time_offset(val)
 
     def _on_global_xlim_changed(self):
         def _parse(text):
@@ -2275,9 +2368,13 @@ class MainWindow(QMainWindow):
                 return float(text.strip())
             except ValueError:
                 return None
-        xmin = _parse(self._gxmin_edit.text())
-        xmax = _parse(self._gxmax_edit.text())
-        self._plot_grid.set_global_xlim(xmin, xmax)
+        self.plot_grid.set_global_xlim(
+            _parse(self.gxmin_edit.text()),
+            _parse(self.gxmax_edit.text()),
+        )
+
+    def _on_search(self, text: str):
+        self.browser.filter_text(text)
 
     # ── Templates ─────────────────────────────────────────────────────────────
 
@@ -2289,9 +2386,10 @@ class MainWindow(QMainWindow):
             return
         if not path.endswith('.boppo'):
             path += '.boppo'
-        layout = self._plot_grid.get_layout_config()
+        layout = self.plot_grid.get_layout_config()
+        layout['schema_version'] = 2
+        layout['datasets'] = self.registry.export_manifest()
         try:
-            import json
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(layout, f, indent=2)
         except Exception as ex:
@@ -2304,215 +2402,54 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            import json
             with open(path, 'r', encoding='utf-8') as f:
                 layout = json.load(f)
         except Exception as ex:
             QMessageBox.critical(self, "Load Template", f"Failed to load:\n{ex}")
             return
-        rows = layout.get('rows', 2)
-        cols = layout.get('cols', 3)
-        self._rows_spin.setValue(rows)
-        self._cols_spin.setValue(cols)
-        self._plot_grid.set_grid(rows, cols)
-        for pw, snap in zip(self._plot_grid._flat(), layout.get('plots', [])):
-            pw.restore(snap)
-            pw.refresh()
 
-    # ── Search ────────────────────────────────────────────────────────────────
-
-    def _on_search(self, text: str):
-        self._channel_browser.filter_text(text)
-
-    # ── Tab 2: Field Data Overlay handlers ───────────────────────────────────
-
-    def _t2_load_psse(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select PSS/E results folder")
-        if not folder:
-            return
-        try:
-            self._t2_psse_folder = PSSEFolder(folder)
-        except Exception as ex:
-            QMessageBox.critical(self, "Load Error", f"PSSE:\n{ex}")
-            return
-        self._t2_psse_sel.blockSignals(True)
-        self._t2_psse_sel.clear()
-        for ds in self._t2_psse_folder.datasets:
-            self._t2_psse_sel.addItem(ds.name)
-        self._t2_psse_sel.blockSignals(False)
-        try:
-            names = self._t2_psse_folder.channel_names()
-            self._t2_browser.set_psse_channels(names)
-        except Exception as ex:
-            QMessageBox.warning(self, "PSSE Channel Warning", str(ex))
-        self._t2_refresh_datasets()
-
-    def _t2_load_pscad(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select PSCAD results folder")
-        if not folder:
-            return
-        try:
-            if list(Path(folder).glob('*.psout')):
-                self._t2_pscad_folder = PSCADPsoutFolder(folder)
-            else:
-                self._t2_pscad_folder = PSCADFolder(folder)
-        except Exception as ex:
-            QMessageBox.critical(self, "Load Error", f"PSCAD:\n{ex}")
-            return
-        self._t2_pscad_sel.blockSignals(True)
-        self._t2_pscad_sel.clear()
-        for ds in self._t2_pscad_folder.datasets:
-            self._t2_pscad_sel.addItem(ds.name)
-        self._t2_pscad_sel.blockSignals(False)
-        names = self._t2_pscad_folder.channel_names()
-        self._t2_browser.set_pscad_channels(
-            names, units_fn=self._t2_pscad_folder.channel_units
-        )
-        self._t2_refresh_datasets()
-
-    def _t2_load_field(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select field data file", "",
-            "Field Data (*.csv *.xlsx);;All files (*)"
-        )
-        if not path:
-            return
-        try:
-            ds = FieldDataset(path)
-            names = ds.channels   # trigger load + validate
-        except Exception as ex:
-            QMessageBox.critical(self, "Load Error", f"Field data:\n{ex}")
-            return
-        self._t2_field_ds = ds
-        self._t2_field_label.setText(Path(path).name)
-        self._t2_browser.set_field_channels(names)
-        self._t2_plot_grid.set_field_ds(ds)
-
-    def _t2_on_psse_sel_changed(self, idx: int):
-        self._t2_refresh_datasets()
-
-    def _t2_on_pscad_sel_changed(self, idx: int):
-        self._t2_refresh_datasets()
-
-    def _t2_refresh_datasets(self):
-        psse_ds = (
-            self._t2_psse_folder.datasets[self._t2_psse_sel.currentIndex()]
-            if self._t2_psse_folder and self._t2_psse_folder.datasets
-            and 0 <= self._t2_psse_sel.currentIndex() < len(self._t2_psse_folder.datasets)
-            else None
-        )
-        pscad_idx = self._t2_pscad_sel.currentIndex()
-        pscad_src = (
-            self._t2_pscad_folder.datasets[pscad_idx]
-            if self._t2_pscad_folder and self._t2_pscad_folder.datasets
-            and 0 <= pscad_idx < len(self._t2_pscad_folder.datasets)
-            else self._t2_pscad_folder
-        )
-        self._t2_plot_grid.set_datasets(psse_ds, pscad_src)
-
-    def _t2_apply_grid(self):
-        self._t2_plot_grid.set_grid(
-            self._t2_rows_spin.value(), self._t2_cols_spin.value()
-        )
-
-    def _t2_on_offset_changed(self, val: float):
-        self._t2_plot_grid.set_time_offset(val)
-
-    def _t2_on_global_xlim_changed(self):
-        def _parse(text):
-            try:
-                return float(text.strip())
-            except ValueError:
-                return None
-        self._t2_plot_grid.set_global_xlim(
-            _parse(self._t2_gxmin_edit.text()),
-            _parse(self._t2_gxmax_edit.text()),
-        )
-
-    def _t2_on_search(self, text: str):
-        self._t2_browser.filter_text(text)
-
-    def _t2_save_template(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Template", "", "BOPPO Template (*.boppo);;All files (*)"
-        )
-        if not path:
-            return
-        if not path.endswith('.boppo'):
-            path += '.boppo'
-        try:
-            import json
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(self._t2_plot_grid.get_layout_config(), f, indent=2)
-        except Exception as ex:
-            QMessageBox.critical(self, "Save Template", f"Failed to save:\n{ex}")
-
-    def _t2_load_template(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load Template", "", "BOPPO Template (*.boppo);;All files (*)"
-        )
-        if not path:
-            return
-        try:
-            import json
-            with open(path, 'r', encoding='utf-8') as f:
-                layout = json.load(f)
-        except Exception as ex:
-            QMessageBox.critical(self, "Load Template", f"Failed to load:\n{ex}")
-            return
-        rows = layout.get('rows', 2)
-        cols = layout.get('cols', 3)
-        self._t2_rows_spin.setValue(rows)
-        self._t2_cols_spin.setValue(cols)
-        self._t2_plot_grid.set_grid(rows, cols)
-        for pw, snap in zip(self._t2_plot_grid._flat(), layout.get('plots', [])):
-            pw.restore(snap)
-            pw.refresh()
-
-    def _t2_export(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Field Data Plot", "",
-            "PDF (*.pdf);;PNG (*.png);;All files (*)"
-        )
-        if not path:
-            return
-
-        layout = self._t2_plot_grid.get_layout_config()
-        offset = self._t2_offset_spin.value()
-
-        # Use whichever preview datasets are currently selected
-        psse_ds = (
-            self._t2_psse_folder.datasets[self._t2_psse_sel.currentIndex()]
-            if self._t2_psse_folder and self._t2_psse_folder.datasets
-            and 0 <= self._t2_psse_sel.currentIndex() < len(self._t2_psse_folder.datasets)
-            else None
-        )
-        pscad_idx = self._t2_pscad_sel.currentIndex()
-        pscad_ds = (
-            self._t2_pscad_folder.datasets[pscad_idx]
-            if self._t2_pscad_folder and self._t2_pscad_folder.datasets
-            and 0 <= pscad_idx < len(self._t2_pscad_folder.datasets)
-            else self._t2_pscad_folder
-        )
-
-        try:
-            fig = self._t2_plot_grid.render_page(
-                psse_ds, pscad_ds, offset, layout,
-                global_xmin=self._t2_plot_grid._global_xmin,
-                global_xmax=self._t2_plot_grid._global_xmax,
-                field_ds=self._t2_field_ds,
+        if 'datasets' not in layout or layout.get('schema_version', 1) == 1:
+            QMessageBox.information(
+                self, "Legacy Template",
+                "This is a legacy template (single dataset per format). Load your "
+                "PSSE/PSCAD/Field folders as usual; channels will bind to the "
+                "first-loaded dataset of each type."
             )
-            if path.lower().endswith('.png'):
-                fig.savefig(path, dpi=150, bbox_inches='tight')
-            else:
-                if not path.lower().endswith('.pdf'):
-                    path += '.pdf'
-                fig.savefig(path, bbox_inches='tight')
-            plt.close(fig)
-            QMessageBox.information(self, "Export Complete", f"Saved to:\n{path}")
-        except Exception as ex:
-            plt.close('all')
-            QMessageBox.critical(self, "Export Error", str(ex))
+        else:
+            missing = []
+            for entry in layout.get('datasets', []):
+                kind = entry.get('kind')
+                fid  = entry.get('id')
+                ds_path = entry.get('path', '')
+                label = entry.get('label')
+                try:
+                    if kind == 'PSSE':
+                        self.registry.add_psse(ds_path, forced_id=fid, label=label)
+                    elif kind == 'PSCAD':
+                        self.registry.add_pscad(ds_path, forced_id=fid, label=label)
+                    elif kind == 'Field':
+                        self.registry.add_field(ds_path, forced_id=fid, label=label)
+                    self._populate_browser_for(fid)
+                except Exception:
+                    missing.append(f"{ds_path} (dataset {fid})")
+            self._refresh_ds_list()
+            self._update_status()
+            if missing:
+                QMessageBox.warning(
+                    self, "Template Load",
+                    f"{len(missing)} dataset(s) could not be reloaded — channels "
+                    "from these will show fetch errors until reloaded manually:\n\n"
+                    + '\n'.join(missing)
+                )
+
+        rows = layout.get('rows', 2)
+        cols = layout.get('cols', 3)
+        self.rows_spin.setValue(rows)
+        self.cols_spin.setValue(cols)
+        self.plot_grid.set_grid(rows, cols)
+        for pw, snap in zip(self.plot_grid._flat(), layout.get('plots', [])):
+            pw.restore(snap)
+            pw.refresh()
 
     # ── Export ────────────────────────────────────────────────────────────────
 
@@ -2523,30 +2460,14 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-
-        layout = self._plot_grid.get_layout_config()
-        offset = self._offset_spin.value()
-
-        psse_ds = (
-            self._psse_folder.datasets[self._psse_sel.currentIndex()]
-            if self._psse_folder and self._psse_folder.datasets
-            and 0 <= self._psse_sel.currentIndex() < len(self._psse_folder.datasets)
-            else None
-        )
-        pscad_idx = self._pscad_sel.currentIndex()
-        pscad_ds = (
-            self._pscad_folder.datasets[pscad_idx]
-            if self._pscad_folder and self._pscad_folder.datasets
-            and 0 <= pscad_idx < len(self._pscad_folder.datasets)
-            else self._pscad_folder
-        )
-
+        layout = self.plot_grid.get_layout_config()
+        offset = self.offset_spin.value()
         try:
-            fig = self._plot_grid.render_page(
-                psse_ds, pscad_ds, offset, layout,
-                global_xmin=self._plot_grid._global_xmin,
-                global_xmax=self._plot_grid._global_xmax,
-                field_ds=None,
+            fig = self.plot_grid.render_page(
+                self.registry, offset, layout,
+                global_xmin=self.plot_grid._global_xmin,
+                global_xmax=self.plot_grid._global_xmax,
+                page_size=PAGE_SIZES.get(self.page_size_combo.currentText()),
             )
             if path.lower().endswith('.png'):
                 fig.savefig(path, dpi=150, bbox_inches='tight')
@@ -2561,10 +2482,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export Error", str(ex))
 
     def _export(self):
-        psse_dir  = str(self._psse_folder.folder)  if self._psse_folder  else ''
-        pscad_dir = str(self._pscad_folder.folder) if self._pscad_folder else ''
-
-        dlg = ExportDialog(psse_dir, pscad_dir, self)
+        dlg = ExportDialog(self.registry, self)
         if dlg.exec_() != QDialog.Accepted:
             return
         p = dlg.params()
@@ -2573,30 +2491,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Export", "Please select an output folder.")
             return
 
-        layout = self._plot_grid.get_layout_config()
-        offset = self._offset_spin.value()
+        layout = self.plot_grid.get_layout_config()
+        offset = self.offset_spin.value()
         out_dir = Path(p['out_folder'])
         fmt     = p['format']
 
         # ── Single-page (current screen) export ───────────────────────────────
         if p['single_page']:
-            psse_ds  = (self._psse_folder.datasets[self._psse_sel.currentIndex()]
-                        if self._psse_folder and self._psse_folder.datasets
-                        and 0 <= self._psse_sel.currentIndex() < len(self._psse_folder.datasets)
-                        else None)
-            pscad_idx = self._pscad_sel.currentIndex()
-            pscad_ds = (
-                self._pscad_folder.datasets[pscad_idx]
-                if self._pscad_folder and self._pscad_folder.datasets
-                and 0 <= pscad_idx < len(self._pscad_folder.datasets)
-                else self._pscad_folder
-            )
             try:
-                fig = self._plot_grid.render_page(
-                    psse_ds, pscad_ds, offset, layout,
-                    global_xmin=self._plot_grid._global_xmin,
-                    global_xmax=self._plot_grid._global_xmax,
-                    field_ds=None,
+                fig = self.plot_grid.render_page(
+                    self.registry, offset, layout,
+                    global_xmin=self.plot_grid._global_xmin,
+                    global_xmax=self.plot_grid._global_xmax,
+                    page_size=p['page_size'],
                 )
                 name = p['single_name']
                 if 'PDF' in fmt:
@@ -2614,10 +2521,16 @@ class MainWindow(QMainWindow):
             return
 
         # ── Batch (loop) export ───────────────────────────────────────────────
-        # Load source folders
+        # Batch export reloads its own folders by path (orthogonal to registry).
         try:
-            psse_folder  = PSSEFolder(p['psse_folder'])  if p['psse_folder']  else None
-            pscad_folder = PSCADFolder(p['pscad_folder']) if p['pscad_folder'] else None
+            psse_folder = PSSEFolder(p['psse_folder']) if p['psse_folder'] else None
+            if p['pscad_folder']:
+                if list(Path(p['pscad_folder']).glob('*.psout')):
+                    pscad_folder = PSCADPsoutFolder(p['pscad_folder'])
+                else:
+                    pscad_folder = PSCADFolder(p['pscad_folder'])
+            else:
+                pscad_folder = None
         except Exception as ex:
             QMessageBox.critical(self, "Export Error", str(ex))
             return
@@ -2640,7 +2553,6 @@ class MainWindow(QMainWindow):
         use_date    = p.get('title_date', True)
         export_date = datetime.date.today().strftime('%d %b %Y') if use_date else ''
 
-        # Load per-page titles from xlsx if provided
         xlsx_titles: List[str] = []
         if p.get('title_xlsx') and os.path.isfile(p['title_xlsx']):
             try:
@@ -2663,7 +2575,6 @@ class MainWindow(QMainWindow):
                 parts.append(export_date)
             return '   '.join(parts) if parts else fallback
 
-        # Progress
         prog = QProgressDialog("Exporting pages…", "Cancel", 0, len(primary_list), self)
         prog.setWindowModality(Qt.WindowModal)
         prog.show()
@@ -2682,13 +2593,15 @@ class MainWindow(QMainWindow):
 
             psse_ds  = ds if p['loop_psse'] else fixed_psse
             pscad_ds = fixed_pscad if p['loop_psse'] else ds
+            iter_reg = DatasetRegistry.from_single(psse_ds=psse_ds, pscad_ds=pscad_ds)
 
             try:
-                fig = self._plot_grid.render_page(
-                    psse_ds, pscad_ds, offset, layout,
+                fig = self.plot_grid.render_page(
+                    iter_reg, offset, layout,
                     page_title=_page_title(i, ds.name),
-                    global_xmin=self._plot_grid._global_xmin,
-                    global_xmax=self._plot_grid._global_xmax,
+                    global_xmin=self.plot_grid._global_xmin,
+                    global_xmax=self.plot_grid._global_xmax,
+                    page_size=p['page_size'],
                 )
                 if fmt == 'PDF (combined)' and pdf_combined:
                     pdf_combined.savefig(fig, bbox_inches='tight')
@@ -2712,7 +2625,51 @@ class MainWindow(QMainWindow):
             msg += f"\n\n{len(errors)} error(s):\n" + '\n'.join(errors[:5])
         QMessageBox.information(self, "Export Complete", msg)
 
-    # ── About ─────────────────────────────────────────────────────────────────
+
+class MainWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("BOPPO – Benchmarking Of PSSE and PSCAD Outputs")
+        self.resize(1440, 900)
+
+        self.tabs: List[ComparisonTabController] = []
+        self._build_ui()
+        self._build_menu()
+        self.statusBar().showMessage(
+            "Load PSSE/PSCAD folders, then drag channels onto plots."
+        )
+
+    def _build_ui(self):
+        self._tabs_widget = QTabWidget()
+        self.setCentralWidget(self._tabs_widget)
+        for formats, title in (
+            (['PSSE', 'PSCAD'],          "PSSE vs PSCAD"),
+            (['PSSE', 'PSCAD', 'Field'], "Field Data Overlay"),
+        ):
+            ctrl = ComparisonTabController(formats, statusbar=self.statusBar())
+            self.tabs.append(ctrl)
+            self._tabs_widget.addTab(ctrl, title)
+
+    def _current_tab(self) -> ComparisonTabController:
+        return self.tabs[self._tabs_widget.currentIndex()]
+
+    def _build_menu(self):
+        mb = self.menuBar()
+        fm = mb.addMenu("&File")
+        fm.addAction("Load PSSE folder…",
+                     lambda: self._current_tab()._load_folder('PSSE'),
+                     "Ctrl+Shift+P")
+        fm.addAction("Load PSCAD folder…",
+                     lambda: self._current_tab()._load_folder('PSCAD'),
+                     "Ctrl+Shift+C")
+        fm.addSeparator()
+        fm.addAction("Export All…", lambda: self._current_tab()._export(), "Ctrl+E")
+        fm.addSeparator()
+        fm.addAction("Quit", self.close, "Ctrl+Q")
+
+        hm = mb.addMenu("&Help")
+        hm.addAction("About BOPPO", self._about)
 
     def _about(self):
         QMessageBox.about(
