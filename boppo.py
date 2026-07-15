@@ -75,8 +75,8 @@ def _channel_legend_label(ch: dict, cfg: dict, seen_sources: Optional[set] = Non
             if key in seen_sources:
                 return '_nolegend_'
             seen_sources.add(key)
-        return ch.get('dataset_label', ch['source'])
-    label = f"{ch.get('dataset_label', ch['source'])}: {ch['name']}"
+        return ch['source']
+    label = f"{ch['source']}: {ch['name']}"
     if ch.get('units'):
         label += f"  [{ch['units']}]"
     return label
