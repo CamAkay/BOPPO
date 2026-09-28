@@ -43,11 +43,11 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox, QFileDialog, QMessageBox, QProgressDialog,
     QSizePolicy, QSplitter, QAction, QToolBar, QCheckBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget,
-    QListWidget, QListWidgetItem,
+    QListWidget, QListWidgetItem, QInputDialog,
 )
 from matplotlib.widgets import RectangleSelector
-from PyQt5.QtCore import Qt, QMimeData, QByteArray, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QDrag, QCursor
+from PyQt5.QtCore import Qt, QMimeData, QByteArray, QEvent, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QDrag, QCursor, QKeySequence
 
 import matplotlib
 matplotlib.use('Qt5Agg')
@@ -64,11 +64,17 @@ logger = logging.getLogger(__name__)
 # ─── legend label helper ─────────────────────────────────────────────────────
 
 def _channel_legend_label(ch: dict, cfg: dict, seen_sources: Optional[set] = None) -> str:
-    """Build a legend label for a plotted channel, honouring the per-plot
-    'legend_mode' setting: 'name' (channel name + source) or 'source'
-    (just the source, e.g. 'PSSE' / 'PSCAD' / 'Field'). When grouping by
-    source, `seen_sources` (shared across a plot's channels) is used to
-    suppress duplicate legend entries for repeated sources."""
+    """Build a legend label for a plotted channel. If the channel has a
+    non-empty 'legend_label' (set per-channel in PlotConfigDialog's channel
+    table), that custom text is used verbatim, overriding everything else.
+    Otherwise honours the per-plot 'legend_mode' setting: 'name' (channel
+    name + source) or 'source' (just the source, e.g. 'PSSE' / 'PSCAD' /
+    'Field'). When grouping by source, `seen_sources` (shared across a
+    plot's channels) is used to suppress duplicate legend entries for
+    repeated sources."""
+    custom = (ch.get('legend_label') or '').strip()
+    if custom:
+        return custom
     if cfg.get('legend_mode', 'name') == 'source':
         key = ch.get('dataset_id', ch['source'])
         if seen_sources is not None:
@@ -248,37 +254,16 @@ def _draw_analysis_overlay(ax, metrics: dict, color: str, label_prefix: str = ''
     )
 
 
-# ─── xlsx title helper ────────────────────────────────────────────────────────
+# ─── page title helper ────────────────────────────────────────────────────────
 
-def read_title_xlsx(path: str) -> List[str]:
+def format_title_vars(vars_: dict) -> str:
     """
-    Read an xlsx where row 1 is variable names and rows 2+ are values.
-    Returns one title string per data row; empty cells are omitted.
-
-    Example xlsx:
-        SCR   | Pmax | Qmax
-        1.5   | 100  |
-        2.0   |      | 50
-
-    Returns:
-        ['SCR = 1.5,  Pmax = 100', 'SCR = 2.0,  Qmax = 50']
+    Join a {variable: value} dict into a title fragment, e.g.
+    {'SCR': 1.5, 'Pmax': 100} -> 'SCR = 1.5,  Pmax = 100'.
+    Empty/None values are omitted.
     """
-    import openpyxl
-    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    wb.close()
-    if not rows:
-        return []
-    headers = [str(h).strip() if h is not None else '' for h in rows[0]]
-    titles = []
-    for row in rows[1:]:
-        parts = []
-        for header, val in zip(headers, row):
-            if header and val is not None and str(val).strip():
-                parts.append(f"{header} = {val}")
-        titles.append(',  '.join(parts))
-    return titles
+    parts = [f"{k} = {v}" for k, v in vars_.items() if v not in (None, '')]
+    return ',  '.join(parts)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -1110,11 +1095,13 @@ class PlotConfigDialog(QDialog):
         layout.addRow("", xfm_note)
 
         self._current_assigned = list(assigned)   # working copy; rows can be removed
-        self._xfm_table = QTableWidget(0, 3)
-        self._xfm_table.setHorizontalHeaderLabels(['Channel', 'Expression', ''])
+        self._xfm_table = QTableWidget(0, 4)
+        self._xfm_table.setHorizontalHeaderLabels(['Channel', 'Expression', 'Legend', ''])
         self._xfm_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self._xfm_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self._xfm_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self._xfm_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self._xfm_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self._xfm_table.setToolTip("Leave Legend blank to use the plot's default legend label.")
         self._xfm_table.verticalHeader().setVisible(False)
         self._xfm_table_row = QLabel("Transforms:")
         self._rebuild_xfm_table()
@@ -1184,13 +1171,16 @@ class PlotConfigDialog(QDialog):
 
     def result_assigned(self) -> List[dict]:
         """Return the (possibly reduced) assigned list with updated transform
-        expressions, reflecting any channels removed via the Remove button."""
+        expressions and custom legend labels, reflecting any channels
+        removed via the Remove button."""
         updated = []
         for i, ch in enumerate(self._current_assigned):
             ch_copy = dict(ch)
-            item = self._xfm_table.item(i, 1)
-            expr = item.text().strip() if item else ''
+            expr_item = self._xfm_table.item(i, 1)
+            expr = expr_item.text().strip() if expr_item else ''
             ch_copy['transform'] = expr if expr else 'y'
+            legend_item = self._xfm_table.item(i, 2)
+            ch_copy['legend_label'] = legend_item.text().strip() if legend_item else ''
             updated.append(ch_copy)
         return updated
 
@@ -1201,13 +1191,16 @@ class PlotConfigDialog(QDialog):
             name_item = QTableWidgetItem(f"[{ch['source']}]  {ch['name']}")
             name_item.setFlags(Qt.ItemIsEnabled)   # read-only
             expr_item = QTableWidgetItem(ch.get('transform', 'y'))
+            legend_item = QTableWidgetItem(ch.get('legend_label', ''))
+            legend_item.setToolTip("Blank = use the plot's default legend label")
             self._xfm_table.setItem(i, 0, name_item)
             self._xfm_table.setItem(i, 1, expr_item)
+            self._xfm_table.setItem(i, 2, legend_item)
             rm_btn = QPushButton("✕")
             rm_btn.setFixedWidth(24)
             rm_btn.setToolTip("Remove this channel from the plot")
             rm_btn.clicked.connect(lambda _checked, idx=i: self._remove_channel(idx))
-            self._xfm_table.setCellWidget(i, 2, rm_btn)
+            self._xfm_table.setCellWidget(i, 3, rm_btn)
         self._xfm_table_row.setVisible(bool(self._current_assigned))
         self._xfm_table.setVisible(bool(self._current_assigned))
 
@@ -1882,13 +1875,202 @@ class PlotGrid(QWidget):
 # EXPORT DIALOG
 # ══════════════════════════════════════════════════════════════════════════════
 
+class PageTitleEditorDialog(QDialog):
+    """
+    Table editor for per-file title variables, keyed by filename.
+
+    Column 0 is the (read-only) filename; every other column is a
+    user-defined variable. Values can be typed manually or bulk-filled by
+    applying a regex with named capture groups against each filename.
+    """
+
+    def __init__(self, filenames: List[str], existing: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Page Titles")
+        self.setMinimumSize(560, 420)
+        self._filenames = list(filenames)
+
+        v = QVBoxLayout(self)
+
+        toolbar = QHBoxLayout()
+        btn_add_col = QPushButton("Add Column")
+        btn_add_col.clicked.connect(self._add_column)
+        btn_del_col = QPushButton("Remove Column")
+        btn_del_col.clicked.connect(self._remove_column)
+        btn_regex = QPushButton("Extract from Filename…")
+        btn_regex.clicked.connect(self._extract_from_filename)
+        toolbar.addWidget(btn_add_col)
+        toolbar.addWidget(btn_del_col)
+        toolbar.addWidget(btn_regex)
+        toolbar.addStretch(1)
+        v.addLayout(toolbar)
+
+        self._table = QTableWidget(len(self._filenames), 1)
+        self._table.setHorizontalHeaderLabels(["Filename"])
+        self._table.horizontalHeader().setStretchLastSection(True)
+        for row, name in enumerate(self._filenames):
+            item = QTableWidgetItem(name)
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self._table.setItem(row, 0, item)
+        self._table.installEventFilter(self)
+        v.addWidget(self._table)
+
+        note = QLabel("Tip: use \"Extract from Filename…\" with named capture "
+                       "groups, e.g.  SCR(?P<SCR>[\\d.]+). "
+                       "Ctrl+C / Ctrl+V copies and pastes cells to and from Excel.")
+        note.setStyleSheet("color: #666; font-size: 9px;")
+        v.addWidget(note)
+
+        # Seed columns/values from any existing entries
+        existing_vars = []
+        for name in self._filenames:
+            for var in (existing.get(name) or {}):
+                if var not in existing_vars:
+                    existing_vars.append(var)
+        for var in existing_vars:
+            self._add_column(var)
+        for row, name in enumerate(self._filenames):
+            for var, val in (existing.get(name) or {}).items():
+                col = self._col_for_var(var)
+                if col is not None:
+                    self._table.setItem(row, col, QTableWidgetItem(str(val)))
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        v.addWidget(btns)
+
+    def eventFilter(self, obj, event):
+        # QTableWidget has no built-in clipboard support.
+        if obj is self._table and event.type() == QEvent.KeyPress:
+            if event.matches(QKeySequence.Copy):
+                self._copy_selection()
+                return True
+            if event.matches(QKeySequence.Paste):
+                self._paste_selection()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _copy_selection(self):
+        ranges = self._table.selectedRanges()
+        if not ranges:
+            return
+        r = ranges[0]
+        lines = []
+        for row in range(r.topRow(), r.bottomRow() + 1):
+            cells = []
+            for col in range(r.leftColumn(), r.rightColumn() + 1):
+                item = self._table.item(row, col)
+                cells.append(item.text() if item else "")
+            lines.append("\t".join(cells))
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def _paste_selection(self):
+        text = QApplication.clipboard().text()
+        if not text:
+            return
+        rows = [line.split("\t") for line in text.replace("\r\n", "\n").rstrip("\n").split("\n")]
+
+        start_row = max(self._table.currentRow(), 0)
+        # Column 0 is the read-only filename -- never paste over it.
+        start_col = max(self._table.currentColumn(), 1)
+
+        needed = start_col + max(len(r) for r in rows)
+        if needed > self._table.columnCount():
+            QMessageBox.information(
+                self, "Paste",
+                "The pasted data is wider than the available variable columns. "
+                "Add more columns first -- extra values were dropped.")
+
+        for i, row_vals in enumerate(rows):
+            row = start_row + i
+            if row >= self._table.rowCount():
+                break  # rows are fixed to the filename list
+            for j, val in enumerate(row_vals):
+                col = start_col + j
+                if col >= self._table.columnCount():
+                    break
+                self._table.setItem(row, col, QTableWidgetItem(val.strip()))
+
+    def _col_for_var(self, var: str) -> Optional[int]:
+        for c in range(1, self._table.columnCount()):
+            header = self._table.horizontalHeaderItem(c)
+            if header and header.text() == var:
+                return c
+        return None
+
+    def _add_column(self, name: Optional[str] = None) -> Optional[int]:
+        if name is None:
+            name, ok = QInputDialog.getText(self, "Add Column", "Variable name:")
+            if not ok or not name.strip():
+                return None
+            name = name.strip()
+        existing_col = self._col_for_var(name)
+        if existing_col is not None:
+            return existing_col
+        col = self._table.columnCount()
+        self._table.setColumnCount(col + 1)
+        self._table.setHorizontalHeaderItem(col, QTableWidgetItem(name))
+        return col
+
+    def _remove_column(self):
+        col = self._table.currentColumn()
+        if col <= 0:
+            QMessageBox.information(self, "Remove Column",
+                                     "Select a variable column to remove (not Filename).")
+            return
+        self._table.removeColumn(col)
+
+    def _extract_from_filename(self):
+        pattern, ok = QInputDialog.getText(
+            self, "Extract from Filename",
+            "Regex with named groups, e.g.  SCR(?P<SCR>[\\d.]+)_Pmax(?P<Pmax>\\d+)"
+        )
+        if not ok or not pattern.strip():
+            return
+        try:
+            rx = re.compile(pattern)
+        except re.error as ex:
+            QMessageBox.warning(self, "Invalid Regex", str(ex))
+            return
+        if not rx.groupindex:
+            QMessageBox.warning(self, "Invalid Regex",
+                                 "Pattern must contain at least one named group, e.g. (?P<SCR>...).")
+            return
+
+        matched = 0
+        for row, name in enumerate(self._filenames):
+            m = rx.search(name)
+            if not m:
+                continue
+            matched += 1
+            for var, val in m.groupdict().items():
+                if val is None:
+                    continue
+                col = self._add_column(var)
+                self._table.setItem(row, col, QTableWidgetItem(val))
+        if matched == 0:
+            QMessageBox.information(self, "Extract from Filename",
+                                     "The pattern did not match any filenames.")
+
+    def result_titles(self) -> dict:
+        titles = {}
+        for row, name in enumerate(self._filenames):
+            vars_ = {}
+            for col in range(1, self._table.columnCount()):
+                header = self._table.horizontalHeaderItem(col)
+                item = self._table.item(row, col)
+                if header and item and item.text().strip():
+                    vars_[header.text()] = item.text().strip()
+            if vars_:
+                titles[name] = vars_
+        return titles
+
+
 class ExportDialog(QDialog):
-    """Configure folders, output path, format, and title xlsx for batch export."""
+    """Configure folders, output path, format, and page titles for batch export."""
 
-    # Default location to look for the title xlsx
-    _DEFAULT_XLSX_DIR = r"C:\Users\CamSmith\Documents\Claude Working Folder\Benchmarking Tool"
-
-    def __init__(self, registry: 'DatasetRegistry', parent=None):
+    def __init__(self, registry: 'DatasetRegistry', page_titles: Optional[dict] = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Export Results")
         self.setMinimumWidth(560)
@@ -1938,44 +2120,33 @@ class ExportDialog(QDialog):
         self._single_name_label = QLabel("Filename (no ext):")
         layout.addRow(self._single_name_label, self._single_name_edit)
 
-        # Loop mode
-        self._loop_label = QLabel("Iteration:")
-        self._loop_combo = QComboBox()
-        self._loop_combo.addItems([
-            'Loop PSSE files  (one page per PSSE result)',
-            'Loop PSCAD files (one page per PSCAD result)',
-        ])
-        layout.addRow(self._loop_label, self._loop_combo)
+        # Iteration note -- batch export always pages through BOTH folders
+        # together now (paired by position: 1st PSSE file with 1st PSCAD
+        # file, 2nd with 2nd, ...). If one side has only a single file, that
+        # one is reused as a fixed reference on every page. If a side has
+        # more files than the other (and the other has more than one), the
+        # extra files on the longer side are skipped with a warning.
+        self._loop_note = QLabel(
+            "Batch export pages through PSSE and PSCAD files together, "
+            "paired by position. A folder with only one file is used as a "
+            "fixed reference for every page."
+        )
+        self._loop_note.setWordWrap(True)
+        self._loop_note.setStyleSheet("color: #666; font-size: 9px;")
+        layout.addRow("Iteration:", self._loop_note)
 
-        # ── Title xlsx ────────────────────────────────────────────────────────
+        # ── Page titles ───────────────────────────────────────────────────────
         self._sep = QLabel("─── Page titles ──────────────────────────────────────")
         self._sep.setStyleSheet("color: #888; font-size: 9px;")
         layout.addRow(self._sep)
 
-        self._use_xlsx_chk = QCheckBox("Use title xlsx for page names")
-        default_xlsx = self._find_default_xlsx()
-        self._use_xlsx_chk.setChecked(bool(default_xlsx))
-        self._use_xlsx_chk.toggled.connect(self._on_xlsx_toggled)
-        layout.addRow("", self._use_xlsx_chk)
-
-        # Auto-detect an xlsx in the default folder
-        self._xlsx_edit = QLineEdit(default_xlsx)
-        self._xlsx_edit.setPlaceholderText("(leave blank to use dataset filename)")
-        btn_x = QPushButton("Browse…")
-        btn_x.clicked.connect(self._pick_xlsx)
-        h4 = QHBoxLayout(); h4.addWidget(self._xlsx_edit); h4.addWidget(btn_x)
-        self._xlsx_label = QLabel("Title xlsx:")
-        layout.addRow(self._xlsx_label, h4)
-
-        self._xlsx_note = QLabel(
-            "Row 1 = variable names  |  Rows 2+ = one row per exported page\n"
-            "Empty cells are omitted from the title."
-        )
-        self._xlsx_note.setStyleSheet("color: #666; font-size: 9px;")
-        layout.addRow("", self._xlsx_note)
+        self._page_titles = dict(page_titles or {})
+        self._edit_titles_btn = QPushButton("Edit page titles…")
+        self._edit_titles_btn.clicked.connect(self._edit_page_titles)
+        layout.addRow("", self._edit_titles_btn)
 
         self._title_prefix = QLineEdit()
-        self._title_prefix.setPlaceholderText("optional prefix added before xlsx values")
+        self._title_prefix.setPlaceholderText("optional prefix added before title variables")
         layout.addRow("Title prefix:", self._title_prefix)
 
         # ── PDF title options ─────────────────────────────────────────────────
@@ -1998,40 +2169,59 @@ class ExportDialog(QDialog):
 
         # Apply initial visibility
         self._on_fmt_changed(0)
-        self._on_xlsx_toggled(self._use_xlsx_chk.isChecked())
 
     def _on_fmt_changed(self, _index: int):
         single = self._fmt.currentText().startswith('Current screen')
         is_pdf = 'PDF' in self._fmt.currentText()
         self._single_name_label.setVisible(single)
         self._single_name_edit.setVisible(single)
-        self._loop_label.setVisible(not single)
-        self._loop_combo.setVisible(not single)
+        self._loop_note.setVisible(not single)
         self._sep.setVisible(not single)
-        self._use_xlsx_chk.setVisible(not single)
-        self._xlsx_label.setVisible(not single and self._use_xlsx_chk.isChecked())
-        self._xlsx_edit.setVisible(not single and self._use_xlsx_chk.isChecked())
-        self._xlsx_note.setVisible(not single and self._use_xlsx_chk.isChecked())
+        self._edit_titles_btn.setVisible(not single)
+        self._title_prefix.setVisible(not single)
         self._sep2.setVisible(is_pdf and not single)
         self._use_outfile_chk.setVisible(is_pdf and not single)
         self._use_date_chk.setVisible(is_pdf and not single)
 
-    def _on_xlsx_toggled(self, checked: bool):
-        single = self._fmt.currentText().startswith('Current screen')
-        visible = checked and not single
-        self._xlsx_label.setVisible(visible)
-        self._xlsx_edit.setVisible(visible)
-        self._xlsx_note.setVisible(visible)
-
-    @classmethod
-    def _find_default_xlsx(cls) -> str:
-        """Return the first xlsx found in the default directory, or empty string."""
+    @staticmethod
+    def _scan_folder_stems(folder: str, kind: str) -> List[str]:
+        """List filename stems in `folder`, mirroring PSSEFolder/PSCADFolder's
+        file discovery for the given kind ('psse' or 'pscad')."""
+        if not folder or not os.path.isdir(folder):
+            return []
         try:
-            for f in Path(cls._DEFAULT_XLSX_DIR).glob('*.xlsx'):
-                return str(f)
+            folder_path = Path(folder)
+            if kind == 'psse':
+                files = sorted(
+                    list(folder_path.rglob('*.out')) + list(folder_path.rglob('*.outx')),
+                    key=lambda p: p.name,
+                )
+            else:
+                files = sorted(folder_path.glob('*.inf'), key=lambda p: p.name)
+            return [f.stem for f in files]
         except Exception:
-            pass
-        return ''
+            return []
+
+    def _loop_filenames(self) -> List[str]:
+        """List filename stems for page-title editing purposes -- uses
+        whichever of the two selected folders has more files (batch export
+        now pages through both together, paired by position; the side with
+        more files determines how many pages there are)."""
+        psse_files = self._scan_folder_stems(self._psse_combo.currentData() or '', 'psse')
+        pscad_files = self._scan_folder_stems(self._pscad_combo.currentData() or '', 'pscad')
+        return psse_files if len(psse_files) >= len(pscad_files) else pscad_files
+
+    def _edit_page_titles(self):
+        filenames = self._loop_filenames()
+        if not filenames:
+            QMessageBox.information(
+                self, "Edit Page Titles",
+                "Select a PSSE/PSCAD folder and loop mode first so filenames can be listed."
+            )
+            return
+        dlg = PageTitleEditorDialog(filenames, self._page_titles, self)
+        if dlg.exec_() == QDialog.Accepted:
+            self._page_titles = dlg.result_titles()
 
     @staticmethod
     def _make_ds_combo(registry, kind) -> QComboBox:
@@ -2055,15 +2245,6 @@ class ExportDialog(QDialog):
         if folder:
             self._out_edit.setText(folder)
 
-    def _pick_xlsx(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select title xlsx",
-            self._DEFAULT_XLSX_DIR,
-            "Excel files (*.xlsx *.xls)",
-        )
-        if path:
-            self._xlsx_edit.setText(path)
-
     def params(self) -> dict:
         return {
             'psse_folder':    (self._psse_combo.currentData() or '').strip(),
@@ -2073,9 +2254,7 @@ class ExportDialog(QDialog):
             'page_size':      PAGE_SIZES.get(self._page_size.currentText()),
             'single_page':    self._fmt.currentText().startswith('Current screen'),
             'single_name':    self._single_name_edit.text().strip() or 'BOPPO_export',
-            'loop_psse':      self._loop_combo.currentIndex() == 0,
-            'use_xlsx':       self._use_xlsx_chk.isChecked(),
-            'title_xlsx':     self._xlsx_edit.text().strip() if self._use_xlsx_chk.isChecked() else '',
+            'page_titles':    dict(self._page_titles),
             'title_prefix':   self._title_prefix.text().strip(),
             'title_outfile':  self._use_outfile_chk.isChecked(),
             'title_date':     self._use_date_chk.isChecked(),
@@ -2099,6 +2278,12 @@ class ComparisonTabController(QWidget):
         self.formats = formats
         self._statusbar = statusbar
         self.registry = DatasetRegistry()
+        self.page_titles = {}
+        self.page_title_sequence = []       # ordered list, matched to exported pages by
+                                             # POSITION (not filename) -- see _export()'s
+                                             # batch loop; set by AECST via --template
+        self._current_template_path = None  # set when a template is loaded (CLI or dialog);
+                                             # _save_template() writes back here without prompting
         self._build()
         self.plot_grid.set_registry(self.registry)
 
@@ -2306,6 +2491,12 @@ class ComparisonTabController(QWidget):
                 self, f"Select {kind} results folder")
         if not path:
             return
+        self._add_dataset(kind, path)
+
+    def _add_dataset(self, kind: str, path: str):
+        """Load a dataset from an already-known path (no file dialog) --
+        shared tail of _load_folder(), also used for pre-configuring a
+        results folder at startup (e.g. --pscad-folder)."""
         try:
             if kind == 'PSSE':
                 ds_id = self.registry.add_psse(path)
@@ -2392,6 +2583,20 @@ class ComparisonTabController(QWidget):
     # ── Templates ─────────────────────────────────────────────────────────────
 
     def _save_template(self):
+        """
+        Save the current layout as a .boppo template. If a template was
+        already loaded this session (via the Load Template dialog, or via
+        --template on the command line), overwrite that same file directly
+        with no prompt -- this is what keeps an AECST rank preset's linked
+        template in sync: launch BOPPO with --template pointed at the
+        preset's file, edit the layout, hit Save Template, done.
+        """
+        if self._current_template_path:
+            self._write_template_file(self._current_template_path)
+        else:
+            self._save_template_as()
+
+    def _save_template_as(self):
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Template", "", "BOPPO Template (*.boppo);;All files (*)"
         )
@@ -2399,10 +2604,17 @@ class ComparisonTabController(QWidget):
             return
         if not path.endswith('.boppo'):
             path += '.boppo'
+        self._current_template_path = path
+        self._write_template_file(path)
+
+    def _write_template_file(self, path):
         layout = self.plot_grid.get_layout_config()
         layout['schema_version'] = 2
         layout['datasets'] = self.registry.export_manifest()
+        layout['page_titles'] = self.page_titles
+        layout['page_title_sequence'] = self.page_title_sequence
         try:
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(layout, f, indent=2)
         except Exception as ex:
@@ -2414,20 +2626,59 @@ class ComparisonTabController(QWidget):
         )
         if not path:
             return
+        self.load_template_file(path)
+
+    def load_template_file(self, path, pscad_folder_override=None, silent=False):
+        """
+        Load a .boppo template from a known path (no dialog) -- used both
+        by _load_template() above and by main()'s --template CLI handling.
+
+        If the file doesn't exist yet (e.g. an AECST rank preset that has
+        never had a template saved for it), just remember the path so the
+        next _save_template() writes there -- this is how a brand-new
+        preset's first BOPPO session bootstraps its template file. In that
+        case, pscad_folder_override (if given) is still loaded directly via
+        _add_dataset(), since there's no template to apply it to.
+
+        pscad_folder_override, if given, replaces the path of any PSCAD
+        dataset entry in the template with this folder instead of the
+        stale path the template was saved with -- so a shared template can
+        be reused against a fresh run's output folder each time.
+
+        `silent`, if True, prints load failures to stderr instead of
+        showing a QMessageBox -- required for headless/background
+        invocations (see main()'s --export-pdf), where a modal dialog with
+        no one to click it would hang the process forever.
+        """
+        self._current_template_path = path
+        if not os.path.isfile(path):
+            if pscad_folder_override:
+                self._add_dataset('PSCAD', pscad_folder_override)
+            return
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 layout = json.load(f)
         except Exception as ex:
-            QMessageBox.critical(self, "Load Template", f"Failed to load:\n{ex}")
+            if silent:
+                print(f"BOPPO: failed to load template {path}: {ex}", file=sys.stderr)
+            else:
+                QMessageBox.critical(self, "Load Template", f"Failed to load:\n{ex}")
             return
+        self._apply_template(layout, pscad_folder_override=pscad_folder_override, silent=silent)
 
+    def _apply_template(self, layout, pscad_folder_override=None, silent=False):
         if 'datasets' not in layout or layout.get('schema_version', 1) == 1:
-            QMessageBox.information(
-                self, "Legacy Template",
-                "This is a legacy template (single dataset per format). Load your "
-                "PSSE/PSCAD/Field folders as usual; channels will bind to the "
-                "first-loaded dataset of each type."
-            )
+            if silent:
+                print("BOPPO: legacy template (single dataset per format) loaded -- "
+                      "channels will bind to the first-loaded dataset of each type.",
+                      file=sys.stderr)
+            else:
+                QMessageBox.information(
+                    self, "Legacy Template",
+                    "This is a legacy template (single dataset per format). Load your "
+                    "PSSE/PSCAD/Field folders as usual; channels will bind to the "
+                    "first-loaded dataset of each type."
+                )
         else:
             missing = []
             for entry in layout.get('datasets', []):
@@ -2435,6 +2686,8 @@ class ComparisonTabController(QWidget):
                 fid  = entry.get('id')
                 ds_path = entry.get('path', '')
                 label = entry.get('label')
+                if kind == 'PSCAD' and pscad_folder_override:
+                    ds_path = pscad_folder_override
                 try:
                     if kind == 'PSSE':
                         self.registry.add_psse(ds_path, forced_id=fid, label=label)
@@ -2448,12 +2701,20 @@ class ComparisonTabController(QWidget):
             self._refresh_ds_list()
             self._update_status()
             if missing:
-                QMessageBox.warning(
-                    self, "Template Load",
-                    f"{len(missing)} dataset(s) could not be reloaded — channels "
-                    "from these will show fetch errors until reloaded manually:\n\n"
-                    + '\n'.join(missing)
-                )
+                if silent:
+                    print(f"BOPPO: {len(missing)} dataset(s) could not be reloaded -- "
+                          f"channels from these will show fetch errors: {'; '.join(missing)}",
+                          file=sys.stderr)
+                else:
+                    QMessageBox.warning(
+                        self, "Template Load",
+                        f"{len(missing)} dataset(s) could not be reloaded — channels "
+                        "from these will show fetch errors until reloaded manually:\n\n"
+                        + '\n'.join(missing)
+                    )
+
+        self.page_titles = layout.get('page_titles', {})
+        self.page_title_sequence = layout.get('page_title_sequence', [])
 
         rows = layout.get('rows', 2)
         cols = layout.get('cols', 3)
@@ -2495,10 +2756,11 @@ class ComparisonTabController(QWidget):
             QMessageBox.critical(self, "Export Error", str(ex))
 
     def _export(self):
-        dlg = ExportDialog(self.registry, self)
+        dlg = ExportDialog(self.registry, self.page_titles, self)
         if dlg.exec_() != QDialog.Accepted:
             return
         p = dlg.params()
+        self.page_titles = p['page_titles']
 
         if not p['out_folder']:
             QMessageBox.warning(self, "Export", "Please select an output folder.")
@@ -2548,47 +2810,61 @@ class ComparisonTabController(QWidget):
             QMessageBox.critical(self, "Export Error", str(ex))
             return
 
-        if p['loop_psse']:
-            primary_list = psse_folder.datasets if psse_folder else []
-            fixed_pscad  = pscad_folder
-            fixed_psse   = None
-        else:
-            primary_list = pscad_folder.datasets if pscad_folder else []
-            fixed_psse   = psse_folder.datasets[0] if psse_folder and psse_folder.datasets else None
-            fixed_pscad  = pscad_folder
+        psse_list  = psse_folder.datasets if psse_folder else []
+        pscad_list = pscad_folder.datasets if pscad_folder else []
 
-        if not primary_list:
-            QMessageBox.warning(self, "Export", "No result files found to loop over.")
+        if not psse_list and not pscad_list:
+            QMessageBox.warning(self, "Export", "No result files found to export.")
             return
+
+        # Page through BOTH folders together, paired by position (1st PSSE
+        # with 1st PSCAD, 2nd with 2nd, ...). A folder with exactly one file
+        # is treated as a fixed reference reused on every page, matching the
+        # old single-loop behavior. If both have more than one file but
+        # different counts, the extra files on the longer side are skipped
+        # (reported in the completion message) rather than silently dropped.
+        def _at(datasets: List, i: int):
+            if not datasets:
+                return None
+            if len(datasets) == 1:
+                return datasets[0]
+            return datasets[i] if i < len(datasets) else None
+
+        n_pages = max(len(psse_list), len(pscad_list))
+        mismatched_counts = (
+            len(psse_list) > 1 and len(pscad_list) > 1
+            and len(psse_list) != len(pscad_list)
+        )
 
         prefix  = p.get('title_prefix', '').strip()
         use_outfile = p.get('title_outfile', True)
         use_date    = p.get('title_date', True)
         export_date = datetime.date.today().strftime('%d %b %Y') if use_date else ''
 
-        xlsx_titles: List[str] = []
-        if p.get('title_xlsx') and os.path.isfile(p['title_xlsx']):
-            try:
-                xlsx_titles = read_title_xlsx(p['title_xlsx'])
-            except Exception as ex:
-                QMessageBox.warning(
-                    self, "Title xlsx Warning",
-                    f"Could not read title xlsx — falling back to filenames.\n\n{ex}"
-                )
+        page_titles = p.get('page_titles', {})
+        # Ordered titles (e.g. from AECST's preset-driven title_format), matched
+        # to pages by POSITION, not by filename -- see ComparisonTabController's
+        # page_title_sequence and aecst_presets.build_title_sequence(). Takes
+        # priority over the filename-keyed page_titles/prefix/date assembly
+        # below when present for a given page index.
+        page_title_sequence = self.page_title_sequence
 
-        def _page_title(i: int, fallback: str) -> str:
+        def _page_title(fallback: str, index: int) -> str:
+            if index < len(page_title_sequence) and page_title_sequence[index]:
+                return page_title_sequence[index]
             parts = []
             if prefix:
                 parts.append(prefix)
-            if i < len(xlsx_titles) and xlsx_titles[i]:
-                parts.append(xlsx_titles[i])
+            vars_ = page_titles.get(fallback)
+            if vars_:
+                parts.append(format_title_vars(vars_))
             if use_outfile:
                 parts.append(fallback)
             if export_date:
                 parts.append(export_date)
             return '   '.join(parts) if parts else fallback
 
-        prog = QProgressDialog("Exporting pages…", "Cancel", 0, len(primary_list), self)
+        prog = QProgressDialog("Exporting pages…", "Cancel", 0, n_pages, self)
         prog.setWindowModality(Qt.WindowModal)
         prog.show()
 
@@ -2598,20 +2874,23 @@ class ComparisonTabController(QWidget):
 
         errors = []
         n_done = 0
-        for i, ds in enumerate(primary_list):
+        for i in range(n_pages):
             if prog.wasCanceled():
                 break
             prog.setValue(i)
             QApplication.processEvents()
 
-            psse_ds  = ds if p['loop_psse'] else fixed_psse
-            pscad_ds = fixed_pscad if p['loop_psse'] else ds
+            psse_ds  = _at(psse_list, i)
+            pscad_ds = _at(pscad_list, i)
+            if psse_ds is None and pscad_ds is None:
+                continue  # one side ran out of files -- skip this page
+            page_name = (pscad_ds.name if pscad_ds else None) or (psse_ds.name if psse_ds else f"page_{i+1}")
             iter_reg = DatasetRegistry.from_single(psse_ds=psse_ds, pscad_ds=pscad_ds)
 
             try:
                 fig = self.plot_grid.render_page(
                     iter_reg, offset, layout,
-                    page_title=_page_title(i, ds.name),
+                    page_title=_page_title(page_name, i),
                     global_xmin=self.plot_grid._global_xmin,
                     global_xmax=self.plot_grid._global_xmax,
                     page_size=p['page_size'],
@@ -2619,24 +2898,94 @@ class ComparisonTabController(QWidget):
                 if fmt == 'PDF (combined)' and pdf_combined:
                     pdf_combined.savefig(fig, bbox_inches='tight')
                 elif fmt == 'PDF (per page)':
-                    fig.savefig(str(out_dir / f"{ds.name}.pdf"), bbox_inches='tight')
+                    fig.savefig(str(out_dir / f"{page_name}.pdf"), bbox_inches='tight')
                 elif fmt == 'PNG (per page)':
-                    fig.savefig(str(out_dir / f"{ds.name}.png"),
+                    fig.savefig(str(out_dir / f"{page_name}.png"),
                                 dpi=150, bbox_inches='tight')
                 plt.close(fig)
                 n_done += 1
             except Exception as ex:
-                errors.append(f"{ds.name}: {ex}")
+                errors.append(f"{page_name}: {ex}")
                 plt.close('all')
 
         if pdf_combined:
             pdf_combined.close()
 
-        prog.setValue(len(primary_list))
+        prog.setValue(n_pages)
         msg = f"Exported {n_done} page(s) to:\n{out_dir}"
+        if mismatched_counts:
+            msg += (f"\n\nNote: PSSE folder has {len(psse_list)} file(s) and PSCAD folder "
+                    f"has {len(pscad_list)} -- pages beyond the shorter list's length only "
+                    f"contain data from the longer side.")
         if errors:
             msg += f"\n\n{len(errors)} error(s):\n" + '\n'.join(errors[:5])
         QMessageBox.information(self, "Export Complete", msg)
+
+    def export_batch_pdf(self, pscad_folder: str, out_pdf_path: str,
+                          page_size_key: Optional[str] = None,
+                          xmin: Optional[float] = None,
+                          xmax: Optional[float] = None):
+        """
+        Headless equivalent of _export()'s "PDF (combined)" batch path above,
+        used by main()'s --export-pdf CLI flag (AECST's automatic post-run
+        PDF generation). Pages through every result file in `pscad_folder`
+        (paired 1:1 with RANK.txt rows, exactly like the interactive batch
+        export), using this tab's CURRENTLY LOADED plot layout/channels and
+        page_title_sequence (already populated by load_template_file()) --
+        no PSSE side (AECST never has PSSE data), no ExportDialog/
+        QProgressDialog (nothing to show a user headlessly).
+
+        xmin/xmax, if given, fix the X-axis window for every page (passed
+        straight through to render_page()'s global_xmin/global_xmax) --
+        this is a ONE-OFF render parameter for this PDF only, independent
+        of (and never written back into) this tab's own global X-limit
+        fields/the loaded template's saved state.
+
+        Returns (n_done, errors) -- errors is a list of "page_name: message"
+        strings for pages that failed to render, matching _export()'s own
+        per-page error collection.
+        """
+        layout = self.plot_grid.get_layout_config()
+        offset = self.offset_spin.value()
+        page_size = PAGE_SIZES.get(page_size_key) if page_size_key else None
+
+        if list(Path(pscad_folder).glob('*.psout')):
+            pscad_dsfolder = PSCADPsoutFolder(pscad_folder)
+        else:
+            pscad_dsfolder = PSCADFolder(pscad_folder)
+        pscad_list = pscad_dsfolder.datasets
+
+        page_title_sequence = self.page_title_sequence
+
+        def _page_title(fallback: str, index: int) -> str:
+            if index < len(page_title_sequence) and page_title_sequence[index]:
+                return page_title_sequence[index]
+            return fallback
+
+        Path(out_pdf_path).parent.mkdir(parents=True, exist_ok=True)
+        pdf_combined = PdfPages(out_pdf_path)
+        errors = []
+        n_done = 0
+        for i, pscad_ds in enumerate(pscad_list):
+            page_name = pscad_ds.name
+            iter_reg = DatasetRegistry.from_single(pscad_ds=pscad_ds)
+            try:
+                fig = self.plot_grid.render_page(
+                    iter_reg, offset, layout,
+                    page_title=_page_title(page_name, i),
+                    global_xmin=xmin,
+                    global_xmax=xmax,
+                    page_size=page_size,
+                )
+                pdf_combined.savefig(fig, bbox_inches='tight')
+                plt.close(fig)
+                n_done += 1
+            except Exception as ex:
+                errors.append(f"{page_name}: {ex}")
+                plt.close('all')
+
+        pdf_combined.close()
+        return n_done, errors
 
 
 class MainWindow(QMainWindow):
@@ -2705,6 +3054,55 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     win = MainWindow()
+
+    # Optional CLI args (used by AECST to open BOPPO pre-configured for a run):
+    #   --pscad-folder <path>   pre-load a PSCAD results folder into the first tab
+    #   --template <path>       load a .boppo template into the first tab; if
+    #                           given together with --pscad-folder, the template's
+    #                           own (stale) PSCAD dataset path is overridden with
+    #                           --pscad-folder instead of being used as-is
+    def _arg_after(flag):
+        if flag in sys.argv:
+            idx = sys.argv.index(flag)
+            if idx + 1 < len(sys.argv):
+                return sys.argv[idx + 1]
+        return None
+
+    pscad_folder = _arg_after('--pscad-folder')
+    template_path = _arg_after('--template')
+    export_pdf_path = _arg_after('--export-pdf')
+    page_size_key = _arg_after('--page-size')
+    xmin_str = _arg_after('--xmin')
+    xmax_str = _arg_after('--xmax')
+    xmin = float(xmin_str) if xmin_str is not None else None
+    xmax = float(xmax_str) if xmax_str is not None else None
+
+    # --export-pdf <path> [--page-size <key>]: headless mode used by AECST's
+    # automatic post-run PDF generation -- render --template's plot layout
+    # against --pscad-folder's result files into a single combined PDF, then
+    # exit immediately. No window is ever shown/no event loop is entered, so
+    # this can run silently in the background alongside AECST.
+    if export_pdf_path:
+        if template_path:
+            win.tabs[0].load_template_file(
+                template_path, pscad_folder_override=pscad_folder, silent=True)
+        elif pscad_folder:
+            win.tabs[0]._add_dataset('PSCAD', pscad_folder)
+        n_done, errors = win.tabs[0].export_batch_pdf(
+            pscad_folder, export_pdf_path, page_size_key, xmin=xmin, xmax=xmax)
+        if errors:
+            print(f"BOPPO: {len(errors)} error(s) exporting {export_pdf_path}:",
+                  file=sys.stderr)
+            for err in errors:
+                print(f"  {err}", file=sys.stderr)
+        print(f"BOPPO: wrote {n_done} page(s) to {export_pdf_path}")
+        sys.exit(1 if errors else 0)
+
+    if template_path:
+        win.tabs[0].load_template_file(template_path, pscad_folder_override=pscad_folder)
+    elif pscad_folder:
+        win.tabs[0]._add_dataset('PSCAD', pscad_folder)
+
     win.show()
     sys.exit(app.exec_())
 
