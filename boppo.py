@@ -40,7 +40,7 @@ from PyQt5.QtWidgets import (
     QGridLayout, QLabel, QPushButton, QSpinBox, QDoubleSpinBox,
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QFrame,
     QScrollArea, QComboBox, QLineEdit, QFormLayout, QDialog,
-    QDialogButtonBox, QFileDialog, QMessageBox, QProgressDialog,
+    QDialogButtonBox, QFileDialog, QMessageBox, QProgressDialog, QColorDialog,
     QSizePolicy, QSplitter, QAction, QToolBar, QCheckBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget,
     QListWidget, QListWidgetItem, QInputDialog,
@@ -275,6 +275,60 @@ LINE_COLORS  = [
     '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
     '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5',
 ]
+
+# Selectable line styles: (display name, matplotlib linestyle).
+LINE_STYLES: List[Tuple[str, str]] = [
+    ('Solid',    '-'),
+    ('Dashed',   '--'),
+    ('Dash-dot', '-.'),
+    ('Dotted',   ':'),
+]
+DEFAULT_LINE_WIDTH = 0.0   # 0 => use the drawing context's own default
+
+
+def channel_style(ch: dict, ci: int, default_width: float) -> Tuple[str, str, float]:
+    """Resolve a channel's (color, linestyle, linewidth).
+
+    Per-channel overrides live on the channel dict itself ('color',
+    'linestyle', 'linewidth'), so they round-trip through PlotWidget
+    snapshot/restore and .boppo templates alongside 'transform' and
+    'legend_label'. Blank/zero means fall back to the automatic colour
+    cycle and the caller's default width.
+    """
+    color = (ch.get('color') or '').strip() or LINE_COLORS[ci % len(LINE_COLORS)]
+    style = (ch.get('linestyle') or '').strip() or '-'
+    try:
+        width = float(ch.get('linewidth') or 0)
+    except (TypeError, ValueError):
+        width = 0.0
+    return color, style, (width if width > 0 else default_width)
+
+
+def draw_ref_lines(ax, cfg: dict):
+    """Draw the plot's horizontal/vertical reference lines.
+
+    Each entry is {'orient': 'h'|'v', 'value': float, 'label': str,
+    'color': str, 'linestyle': str, 'linewidth': float}. A blank label
+    is kept out of the legend via matplotlib's '_nolegend_' sentinel.
+    """
+    for rl in cfg.get('ref_lines', []) or []:
+        try:
+            value = float(rl.get('value'))
+        except (TypeError, ValueError):
+            continue
+        label = (rl.get('label') or '').strip() or '_nolegend_'
+        try:
+            width = float(rl.get('linewidth') or 0)
+        except (TypeError, ValueError):
+            width = 0.0
+        kw = dict(color=(rl.get('color') or '').strip() or '#444444',
+                  linestyle=(rl.get('linestyle') or '').strip() or '--',
+                  linewidth=width if width > 0 else 1.0,
+                  label=label)
+        if rl.get('orient') == 'v':
+            ax.axvline(value, **kw)
+        else:
+            ax.axhline(value, **kw)
 
 # Standard page sizes for PDF/PNG export, in inches (width, height).
 # 'Auto (fit grid)' preserves the original behaviour of sizing the page
@@ -1005,15 +1059,105 @@ class ChannelBrowser(QTreeWidget):
 # PLOT CONFIG DIALOG
 # ══════════════════════════════════════════════════════════════════════════════
 
+class ColorButton(QPushButton):
+    """A swatch button that opens a colour picker. Empty value == automatic."""
+
+    def __init__(self, color: str = '', parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(52)
+        self._color = (color or '').strip()
+        self.clicked.connect(self._pick)
+        self._refresh()
+
+    def _refresh(self):
+        if self._color:
+            self.setText('')
+            self.setStyleSheet(
+                f"background-color: {self._color}; border: 1px solid #888;")
+            self.setToolTip(f"{self._color} — click to change, right-click to reset")
+        else:
+            self.setText("auto")
+            self.setStyleSheet("color: #888; font-size: 9px;")
+            self.setToolTip("Automatic colour — click to choose one")
+
+    def _pick(self):
+        initial = QColor(self._color) if self._color else QColor('#1f77b4')
+        c = QColorDialog.getColor(initial, self, "Trace colour")
+        if c.isValid():
+            self._color = c.name()
+            self._refresh()
+
+    def contextMenuEvent(self, event):
+        # Right-click clears back to the automatic colour cycle.
+        self._color = ''
+        self._refresh()
+
+    def color(self) -> str:
+        return self._color
+
+
+class StyleCombo(QComboBox):
+    """Line-style picker backed by LINE_STYLES."""
+
+    def __init__(self, style: str = '-', parent=None):
+        super().__init__(parent)
+        for name, code in LINE_STYLES:
+            self.addItem(name, code)
+        idx = self.findData((style or '-').strip() or '-')
+        self.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def style_code(self) -> str:
+        return self.currentData()
+
+
+class WidthSpin(QDoubleSpinBox):
+    """Line-width picker; 0 shows as 'auto' and means 'use the default'."""
+
+    def __init__(self, width: float = 0.0, parent=None):
+        super().__init__(parent)
+        self.setRange(0.0, 10.0)
+        self.setSingleStep(0.1)
+        self.setDecimals(1)
+        self.setSpecialValueText("auto")
+        try:
+            self.setValue(float(width or 0))
+        except (TypeError, ValueError):
+            self.setValue(0.0)
+
+
 class PlotConfigDialog(QDialog):
-    """Edit title, axis labels, legend, axis limits, bands, and per-channel transforms."""
+    """Edit title, axis labels, legend, axis limits, bands, per-channel
+    transforms and trace styling, reference lines, and signal analysis.
+
+    Laid out as tabs rather than one long form -- the settings fall into
+    four fairly independent groups and a single form had grown tall
+    enough to need scrolling.
+    """
 
     def __init__(self, config: dict, assigned: List[dict], parent=None):
         super().__init__(parent)
         self._assigned = assigned   # reference – read-only in dialog
         self.setWindowTitle("Configure Plot")
-        self.setMinimumWidth(520)
-        layout = QFormLayout(self)
+        self.setMinimumWidth(640)
+
+        outer = QVBoxLayout(self)
+        tabs = QTabWidget()
+        outer.addWidget(tabs)
+
+        tabs.addTab(self._build_axes_tab(config), "Axes && Legend")
+        tabs.addTab(self._build_channels_tab(config, assigned), "Channels")
+        tabs.addTab(self._build_ref_lines_tab(config), "Reference Lines")
+        tabs.addTab(self._build_analysis_tab(config), "Analysis")
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        outer.addWidget(btns)
+
+    # ── Tab 1: axes, labels, legend, limits, bands ────────────────────────
+    def _build_axes_tab(self, config: dict) -> QWidget:
+        page = QWidget()
+        layout = QFormLayout(page)
         layout.setSpacing(6)
 
         self._title  = QLineEdit(config.get('title',  ''))
@@ -1036,7 +1180,6 @@ class PlotConfigDialog(QDialog):
         layout.addRow("Legend:",  self._legend)
         layout.addRow("Legend labels:", self._legend_mode)
 
-        # Axis limits – leave blank for auto-scale
         def _fmt(v):
             return '' if v is None else str(v)
 
@@ -1062,7 +1205,6 @@ class PlotConfigDialog(QDialog):
         yrow.addWidget(QLabel("max:")); yrow.addWidget(self._ymax)
         layout.addRow("Y limits:", yrow)
 
-        # ── ±10 % bands ───────────────────────────────────────────────────────
         band_sep = QLabel("─── ±10 % bands ──────────────────────────────────")
         band_sep.setStyleSheet("color: #888; font-size: 9px;")
         layout.addRow(band_sep)
@@ -1081,37 +1223,120 @@ class PlotConfigDialog(QDialog):
         self._bands_source.setEnabled(self._bands_enabled.isChecked())
         layout.addRow("Apply bands to:", self._bands_source)
 
-        # ── Channel transforms ────────────────────────────────────────────────
-        xfm_sep = QLabel("─── Channel transforms ───────────────────────────")
-        xfm_sep.setStyleSheet("color: #888; font-size: 9px;")
-        layout.addRow(xfm_sep)
+        return page
 
-        xfm_note = QLabel(
-            "Use  y  for the raw signal,  t  for time.  "
-            "Examples:  y * 50 + 10    y / 1000    abs(y)    y * t"
+    # ── Tab 2: per-channel transform, legend label, colour/style/width ────
+    def _build_channels_tab(self, config: dict, assigned: List[dict]) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        note = QLabel(
+            "Expression: use  y  for the raw signal,  t  for time "
+            "(e.g.  y * 50 + 10,  abs(y)).  "
+            "Legend blank = plot default.  Colour 'auto' = automatic cycle "
+            "(right-click a swatch to reset it)."
         )
-        xfm_note.setStyleSheet("color: #666; font-size: 9px;")
-        xfm_note.setWordWrap(True)
-        layout.addRow("", xfm_note)
+        note.setStyleSheet("color: #666; font-size: 9px;")
+        note.setWordWrap(True)
+        layout.addWidget(note)
 
         self._current_assigned = list(assigned)   # working copy; rows can be removed
-        self._xfm_table = QTableWidget(0, 4)
-        self._xfm_table.setHorizontalHeaderLabels(['Channel', 'Expression', 'Legend', ''])
-        self._xfm_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self._xfm_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self._xfm_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self._xfm_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self._xfm_table.setToolTip("Leave Legend blank to use the plot's default legend label.")
+        self._xfm_table = QTableWidget(0, 7)
+        self._xfm_table.setHorizontalHeaderLabels(
+            ['Channel', 'Expression', 'Legend', 'Colour', 'Style', 'Width', ''])
+        hh = self._xfm_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.Stretch)
+        for c in (3, 4, 5, 6):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         self._xfm_table.verticalHeader().setVisible(False)
-        self._xfm_table_row = QLabel("Transforms:")
         self._rebuild_xfm_table()
-        if assigned:
-            layout.addRow(self._xfm_table_row, self._xfm_table)
+        layout.addWidget(self._xfm_table)
 
-        # ── Signal analysis ───────────────────────────────────────────────────
-        ana_sep = QLabel("─── Signal analysis ──────────────────────────────")
-        ana_sep.setStyleSheet("color: #888; font-size: 9px;")
-        layout.addRow(ana_sep)
+        self._no_channels_label = QLabel("No channels assigned to this plot yet.")
+        self._no_channels_label.setStyleSheet("color: #888;")
+        self._no_channels_label.setVisible(not self._current_assigned)
+        layout.addWidget(self._no_channels_label)
+
+        return page
+
+    # ── Tab 3: horizontal / vertical reference lines ──────────────────────
+    def _build_ref_lines_tab(self, config: dict) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        note = QLabel(
+            "Horizontal lines are drawn at a Y value; vertical lines at an X "
+            "value. A label, if given, appears in the plot legend."
+        )
+        note.setStyleSheet("color: #666; font-size: 9px;")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        bar = QHBoxLayout()
+        add_h = QPushButton("Add Horizontal")
+        add_h.clicked.connect(lambda: self._add_ref_line('h'))
+        add_v = QPushButton("Add Vertical")
+        add_v.clicked.connect(lambda: self._add_ref_line('v'))
+        bar.addWidget(add_h); bar.addWidget(add_v); bar.addStretch(1)
+        layout.addLayout(bar)
+
+        self._ref_table = QTableWidget(0, 6)
+        self._ref_table.setHorizontalHeaderLabels(
+            ['Orientation', 'Value', 'Label', 'Colour', 'Style', ''])
+        rh = self._ref_table.horizontalHeader()
+        rh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        rh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        rh.setSectionResizeMode(2, QHeaderView.Stretch)
+        for c in (3, 4, 5):
+            rh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self._ref_table.verticalHeader().setVisible(False)
+        layout.addWidget(self._ref_table)
+
+        for rl in (config.get('ref_lines') or []):
+            self._append_ref_row(rl)
+
+        return page
+
+    def _add_ref_line(self, orient: str):
+        self._append_ref_row({'orient': orient, 'value': '', 'label': '',
+                              'color': '#444444', 'linestyle': '--'})
+
+    def _append_ref_row(self, rl: dict):
+        r = self._ref_table.rowCount()
+        self._ref_table.insertRow(r)
+
+        orient = QComboBox()
+        orient.addItem("Horizontal", 'h')
+        orient.addItem("Vertical", 'v')
+        oidx = orient.findData(rl.get('orient', 'h'))
+        orient.setCurrentIndex(oidx if oidx >= 0 else 0)
+        self._ref_table.setCellWidget(r, 0, orient)
+
+        val = rl.get('value')
+        self._ref_table.setItem(r, 1, QTableWidgetItem('' if val in (None, '') else str(val)))
+        self._ref_table.setItem(r, 2, QTableWidgetItem(rl.get('label', '') or ''))
+        self._ref_table.setCellWidget(r, 3, ColorButton(rl.get('color', '#444444')))
+        self._ref_table.setCellWidget(r, 4, StyleCombo(rl.get('linestyle', '--')))
+
+        rm = QPushButton("✕")
+        rm.setFixedWidth(24)
+        rm.setToolTip("Remove this reference line")
+        rm.clicked.connect(lambda _checked, btn=rm: self._remove_ref_row(btn))
+        self._ref_table.setCellWidget(r, 5, rm)
+
+    def _remove_ref_row(self, btn):
+        # Resolve the row at click time -- indices shift as rows are removed.
+        for r in range(self._ref_table.rowCount()):
+            if self._ref_table.cellWidget(r, 5) is btn:
+                self._ref_table.removeRow(r)
+                return
+
+    # ── Tab 4: signal analysis ────────────────────────────────────────────
+    def _build_analysis_tab(self, config: dict) -> QWidget:
+        page = QWidget()
+        layout = QFormLayout(page)
 
         self._ana_enabled = QCheckBox()
         self._ana_enabled.setChecked(config.get('analysis_enabled', False))
@@ -1139,10 +1364,7 @@ class PlotConfigDialog(QDialog):
         self._ana_enabled.toggled.connect(_toggle_ana)
         _toggle_ana(self._ana_enabled.isChecked())
 
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        layout.addRow(btns)
+        return page
 
     @staticmethod
     def _parse(text: str) -> Optional[float]:
@@ -1164,15 +1386,35 @@ class PlotConfigDialog(QDialog):
             'ymax':               self._parse(self._ymax.text()),
             'bands_enabled':      self._bands_enabled.isChecked(),
             'bands_source':       self._bands_source.currentText(),
+            'ref_lines':          self.result_ref_lines(),
             'analysis_enabled':   self._ana_enabled.isChecked(),
             'analysis_source':    self._ana_source.currentText(),
             'analysis_settle_pct': self._ana_settle.value(),
         }
 
+    def result_ref_lines(self) -> List[dict]:
+        """Reference lines from the table. Rows with an unparseable value are
+        dropped, since a line with no position cannot be drawn."""
+        out = []
+        for r in range(self._ref_table.rowCount()):
+            val_item = self._ref_table.item(r, 1)
+            value = self._parse(val_item.text()) if val_item else None
+            if value is None:
+                continue
+            label_item = self._ref_table.item(r, 2)
+            out.append({
+                'orient':    self._ref_table.cellWidget(r, 0).currentData(),
+                'value':     value,
+                'label':     label_item.text().strip() if label_item else '',
+                'color':     self._ref_table.cellWidget(r, 3).color() or '#444444',
+                'linestyle': self._ref_table.cellWidget(r, 4).style_code(),
+            })
+        return out
+
     def result_assigned(self) -> List[dict]:
         """Return the (possibly reduced) assigned list with updated transform
-        expressions and custom legend labels, reflecting any channels
-        removed via the Remove button."""
+        expressions, custom legend labels, and per-trace styling, reflecting
+        any channels removed via the Remove button."""
         updated = []
         for i, ch in enumerate(self._current_assigned):
             ch_copy = dict(ch)
@@ -1181,12 +1423,15 @@ class PlotConfigDialog(QDialog):
             ch_copy['transform'] = expr if expr else 'y'
             legend_item = self._xfm_table.item(i, 2)
             ch_copy['legend_label'] = legend_item.text().strip() if legend_item else ''
+            ch_copy['color']     = self._xfm_table.cellWidget(i, 3).color()
+            ch_copy['linestyle'] = self._xfm_table.cellWidget(i, 4).style_code()
+            ch_copy['linewidth'] = self._xfm_table.cellWidget(i, 5).value()
             updated.append(ch_copy)
         return updated
 
     def _rebuild_xfm_table(self):
         self._xfm_table.setRowCount(len(self._current_assigned))
-        self._xfm_table.setMinimumHeight(min(len(self._current_assigned) * 28 + 28, 180))
+        self._xfm_table.setMinimumHeight(min(len(self._current_assigned) * 30 + 30, 240))
         for i, ch in enumerate(self._current_assigned):
             name_item = QTableWidgetItem(f"[{ch['source']}]  {ch['name']}")
             name_item.setFlags(Qt.ItemIsEnabled)   # read-only
@@ -1196,17 +1441,20 @@ class PlotConfigDialog(QDialog):
             self._xfm_table.setItem(i, 0, name_item)
             self._xfm_table.setItem(i, 1, expr_item)
             self._xfm_table.setItem(i, 2, legend_item)
+            self._xfm_table.setCellWidget(i, 3, ColorButton(ch.get('color', '')))
+            self._xfm_table.setCellWidget(i, 4, StyleCombo(ch.get('linestyle', '-')))
+            self._xfm_table.setCellWidget(i, 5, WidthSpin(ch.get('linewidth', 0.0)))
             rm_btn = QPushButton("✕")
             rm_btn.setFixedWidth(24)
             rm_btn.setToolTip("Remove this channel from the plot")
             rm_btn.clicked.connect(lambda _checked, idx=i: self._remove_channel(idx))
-            self._xfm_table.setCellWidget(i, 3, rm_btn)
-        self._xfm_table_row.setVisible(bool(self._current_assigned))
-        self._xfm_table.setVisible(bool(self._current_assigned))
+            self._xfm_table.setCellWidget(i, 6, rm_btn)
 
     def _remove_channel(self, idx: int):
         del self._current_assigned[idx]
         self._rebuild_xfm_table()
+        if hasattr(self, '_no_channels_label'):
+            self._no_channels_label.setVisible(not self._current_assigned)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1374,7 +1622,7 @@ class PlotWidget(QFrame):
         bands_src = cfg.get('bands_source', 'PSCAD')
 
         for ci, ch in enumerate(self.assigned):
-            color = LINE_COLORS[ci % len(LINE_COLORS)]
+            color, lstyle, lwidth = channel_style(ch, ci, 1.1)
             try:
                 t, y = self._fetch(ch)
                 if ch['source'] == 'PSSE':
@@ -1387,7 +1635,8 @@ class PlotWidget(QFrame):
                              'pi': np.pi, '__builtins__': {}}
                     y = eval(transform, _safe)   # noqa: S307 – user-controlled expression
                 label = _channel_legend_label(ch, cfg, seen_sources)
-                line, = self.ax.plot(t, y, color=color, linewidth=1.1, label=label)
+                line, = self.ax.plot(t, y, color=color, linestyle=lstyle,
+                                     linewidth=lwidth, label=label)
                 self._lines.append(line)
                 # ±10 % bands
                 if bands_on and (bands_src == 'Both' or ch['source'] == bands_src):
@@ -1397,14 +1646,19 @@ class PlotWidget(QFrame):
                                  linestyle='--', alpha=0.65, label='_nolegend_')
             except Exception as ex:
                 errors.append(str(ex))
+        draw_ref_lines(self.ax, cfg)
         if cfg.get('title'):
             self.ax.set_title(cfg['title'], fontsize=9, pad=3)
         if cfg.get('xlabel'):
             self.ax.set_xlabel(cfg['xlabel'], fontsize=8)
         if cfg.get('ylabel'):
             self.ax.set_ylabel(cfg['ylabel'], fontsize=8)
-        if self._lines and cfg.get('legend'):
-            self.ax.legend(fontsize=7, loc='best')
+        # Ref lines can carry a legend label of their own, so a plot with
+        # only reference lines still warrants a legend.
+        if (self._lines or cfg.get('ref_lines')) and cfg.get('legend'):
+            handles, _ = self.ax.get_legend_handles_labels()
+            if handles:
+                self.ax.legend(fontsize=7, loc='best')
         self.ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.5)
 
         # ── Signal analysis overlay ───────────────────────────────────────────
@@ -1783,7 +2037,7 @@ class PlotGrid(QWidget):
             plotted   = []   # (ch, t, y, color) for analysis
             seen_sources: set = set()
             for ci, ch in enumerate(assigned):
-                color = LINE_COLORS[ci % len(LINE_COLORS)]
+                color, lstyle, lwidth = channel_style(ch, ci, 1.0)
                 try:
                     entry = _resolve_dataset(registry, ch)
                     if entry is None:
@@ -1799,7 +2053,8 @@ class PlotGrid(QWidget):
                                  'pi': np.pi, '__builtins__': {}}
                         y = eval(transform, _safe)   # noqa: S307
                     label = _channel_legend_label(ch, cfg, seen_sources)
-                    ax.plot(t, y, color=color, linewidth=1.0, label=label)
+                    ax.plot(t, y, color=color, linestyle=lstyle,
+                            linewidth=lwidth, label=label)
                     plotted.append((ch, t, y, color))
                     if bands_on and (bands_src == 'Both' or ch['source'] == bands_src):
                         ax.plot(t, y * 1.1, color=color, linewidth=0.7,
@@ -1809,6 +2064,7 @@ class PlotGrid(QWidget):
                 except Exception as ex:
                     ax.text(0.5, 0.5, str(ex), transform=ax.transAxes,
                             ha='center', va='center', fontsize=7, color='red')
+            draw_ref_lines(ax, cfg)
             if cfg.get('title'):
                 ax.set_title(cfg['title'], fontsize=9, pad=3)
             if cfg.get('xlabel'):
@@ -1816,9 +2072,11 @@ class PlotGrid(QWidget):
             if cfg.get('ylabel'):
                 ax.set_ylabel(cfg['ylabel'], fontsize=8)
             ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.5)
-            if assigned and cfg.get('legend'):
-                ax.legend(fontsize=7, loc='best')
-            if not assigned:
+            if (assigned or cfg.get('ref_lines')) and cfg.get('legend'):
+                handles, _ = ax.get_legend_handles_labels()
+                if handles:
+                    ax.legend(fontsize=7, loc='best')
+            if not assigned and not cfg.get('ref_lines'):
                 ax.text(0.5, 0.5, '(empty)', transform=ax.transAxes,
                         ha='center', va='center', color='#ccc', fontsize=9)
             # Per-plot limits, then global x override
