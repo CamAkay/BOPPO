@@ -1884,7 +1884,8 @@ class PageTitleEditorDialog(QDialog):
     applying a regex with named capture groups against each filename.
     """
 
-    def __init__(self, filenames: List[str], existing: dict, parent=None):
+    def __init__(self, filenames: List[str], existing: dict, parent=None,
+                 columns: Optional[List[str]] = None):
         super().__init__(parent)
         self.setWindowTitle("Edit Page Titles")
         self.setMinimumSize(560, 420)
@@ -1894,7 +1895,7 @@ class PageTitleEditorDialog(QDialog):
 
         toolbar = QHBoxLayout()
         btn_add_col = QPushButton("Add Column")
-        btn_add_col.clicked.connect(self._add_column)
+        btn_add_col.clicked.connect(lambda: self._add_column())
         btn_del_col = QPushButton("Remove Column")
         btn_del_col.clicked.connect(self._remove_column)
         btn_regex = QPushButton("Extract from Filename…")
@@ -1922,7 +1923,7 @@ class PageTitleEditorDialog(QDialog):
         v.addWidget(note)
 
         # Seed columns/values from any existing entries
-        existing_vars = []
+        existing_vars = list(columns or [])
         for name in self._filenames:
             for var in (existing.get(name) or {}):
                 if var not in existing_vars:
@@ -2000,7 +2001,7 @@ class PageTitleEditorDialog(QDialog):
         return None
 
     def _add_column(self, name: Optional[str] = None) -> Optional[int]:
-        if name is None:
+        if not name:
             name, ok = QInputDialog.getText(self, "Add Column", "Variable name:")
             if not ok or not name.strip():
                 return None
@@ -2052,6 +2053,16 @@ class PageTitleEditorDialog(QDialog):
         if matched == 0:
             QMessageBox.information(self, "Extract from Filename",
                                      "The pattern did not match any filenames.")
+
+    def result_columns(self) -> List[str]:
+        """Header names of the variable columns, including ones the user
+        added but left empty -- result_titles() alone would drop those."""
+        names = []
+        for c in range(1, self._table.columnCount()):
+            header = self._table.horizontalHeaderItem(c)
+            if header and header.text().strip():
+                names.append(header.text().strip())
+        return names
 
     def result_titles(self) -> dict:
         titles = {}
@@ -2141,6 +2152,13 @@ class ExportDialog(QDialog):
         layout.addRow(self._sep)
 
         self._page_titles = dict(page_titles or {})
+        # Column names persist separately: a column the user added but left
+        # blank has no values and so never appears in _page_titles.
+        self._page_title_columns = []
+        for _vars in self._page_titles.values():
+            for _v in _vars:
+                if _v not in self._page_title_columns:
+                    self._page_title_columns.append(_v)
         self._edit_titles_btn = QPushButton("Edit page titles…")
         self._edit_titles_btn.clicked.connect(self._edit_page_titles)
         layout.addRow("", self._edit_titles_btn)
@@ -2219,9 +2237,11 @@ class ExportDialog(QDialog):
                 "Select a PSSE/PSCAD folder and loop mode first so filenames can be listed."
             )
             return
-        dlg = PageTitleEditorDialog(filenames, self._page_titles, self)
+        dlg = PageTitleEditorDialog(filenames, self._page_titles, self,
+                                    columns=self._page_title_columns)
         if dlg.exec_() == QDialog.Accepted:
             self._page_titles = dlg.result_titles()
+            self._page_title_columns = dlg.result_columns()
 
     @staticmethod
     def _make_ds_combo(registry, kind) -> QComboBox:
