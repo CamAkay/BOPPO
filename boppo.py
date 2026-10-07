@@ -129,6 +129,19 @@ def _autoscale_y_to_xlim(ax, lines, margin_frac: float = 0.05):
         ax.set_ylim(y_lo - margin, y_hi + margin)
 
 
+def _page_xlim(seq, index, fallback_min, fallback_max):
+    """
+    Effective (xmin, xmax) for batch-export page `index`: each end comes
+    from page_xlim_sequence[index] if set there (e.g. AECST's per-test X
+    window -- matched to pages by POSITION, like page_title_sequence),
+    else the given fallback (the global X-axis limits). Either may be None.
+    """
+    entry = seq[index] if index < len(seq) and seq[index] else (None, None)
+    xmin = entry[0] if len(entry) > 0 and entry[0] is not None else fallback_min
+    xmax = entry[1] if len(entry) > 1 and entry[1] is not None else fallback_max
+    return xmin, xmax
+
+
 def _compute_signal_metrics(
     t: np.ndarray,
     y: np.ndarray,
@@ -252,6 +265,117 @@ def _draw_analysis_overlay(ax, metrics: dict, color: str, label_prefix: str = ''
         f"{prefix}Settle = {m['settle_time']:.4f} s  "
         f"(t0={m['t_0']:.4f} s, settled at {m['t_settle']:.4f} s)"
     )
+
+
+# ─── batch rise/settle metrics export ────────────────────────────────────────
+# Rows are the dicts render_page() appends to `metrics_out` (one per analysed
+# channel), plus 'page' (1-based) and 'file' added by the batch loop.
+
+_METRICS_COLUMNS = [
+    # (header, row key, is a float to format)
+    ('Page',            'page',        False),
+    ('Page title',      'page_title',  False),
+    ('File',            'file',        False),
+    ('Plot',            'plot_title',  False),
+    ('Channel',         'channel',     False),
+    ('Source',          'source',      False),
+    ('Rise time (s)',   'rise_time',   True),
+    ('Settle time (s)', 'settle_time', True),
+    ('t0 (s)',          't_0',         True),
+    ('t10 (s)',         't_10',        True),
+    ('t90 (s)',         't_90',        True),
+    ('t settled (s)',   't_settle',    True),
+    ('Initial',         'y_initial',   True),
+    ('Final',           'y_final',     True),
+    ('Settle band (%)', 'settle_pct',  True),
+    ('Window from (s)', 'xlim_lo',     True),
+    ('Window to (s)',   'xlim_hi',     True),
+    ('Note',            'note',        False),
+]
+# Narrower set for the Word table, so it fits a landscape page.
+_METRICS_DOCX_KEYS = ['page', 'page_title', 'plot_title', 'channel', 'source',
+                      'rise_time', 'settle_time', 't_0', 't_settle', 'note']
+
+
+def _metrics_cells(row: dict) -> Dict[str, str]:
+    """Row dict -> {key: display string}. Invalid metrics (no step found in
+    the window) leave the numeric cells blank with a note instead."""
+    row = dict(row)
+    xlim = row.get('xlim') or (None, None)
+    row['xlim_lo'], row['xlim_hi'] = xlim
+    if not row.get('valid'):
+        row['note'] = 'No step detected in window'
+    cells = {}
+    for _, key, is_float in _METRICS_COLUMNS:
+        val = row.get(key)
+        if val is None:
+            cells[key] = ''
+        elif is_float:
+            cells[key] = f"{val:.4f}" if key != 'settle_pct' else f"{val:g}"
+        else:
+            cells[key] = str(val)
+    return cells
+
+
+def _write_metrics_csv(rows: List[dict], path: str) -> None:
+    import csv
+    with open(path, 'w', newline='', encoding='utf-8-sig') as f:  # BOM so Excel reads UTF-8
+        writer = csv.writer(f)
+        writer.writerow([hdr for hdr, _, _ in _METRICS_COLUMNS])
+        for row in rows:
+            cells = _metrics_cells(row)
+            writer.writerow([cells[key] for _, key, _ in _METRICS_COLUMNS])
+
+
+def _write_metrics_docx(rows: List[dict], path: str, heading: str = '') -> None:
+    """Word table of the key metrics (landscape). Raises ImportError if
+    python-docx isn't installed -- callers treat that as non-fatal."""
+    import docx
+    from docx.enum.section import WD_ORIENT
+    from docx.shared import Pt
+
+    headers = {key: hdr for hdr, key, _ in _METRICS_COLUMNS}
+    document = docx.Document()
+    section = document.sections[0]
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width, section.page_height = section.page_height, section.page_width
+    document.add_heading(heading or 'Rise / settle time results', level=1)
+
+    table = document.add_table(rows=1, cols=len(_METRICS_DOCX_KEYS))
+    table.style = 'Table Grid'
+    for cell, key in zip(table.rows[0].cells, _METRICS_DOCX_KEYS):
+        cell.text = headers[key]
+        cell.paragraphs[0].runs[0].bold = True
+    for row in rows:
+        cells = _metrics_cells(row)
+        for cell, key in zip(table.add_row().cells, _METRICS_DOCX_KEYS):
+            cell.text = cells[key]
+    for tr in table.rows:
+        for cell in tr.cells:
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.font.size = Pt(8)
+    document.save(path)
+
+
+def _write_metrics_files(rows: List[dict], base_path: str, heading: str = '') -> List[str]:
+    """Write <base_path>.csv and <base_path>.docx. Returns a list of
+    problems (empty = both written); no-op if `rows` is empty (no plot had
+    Analysis enabled)."""
+    if not rows:
+        return []
+    problems = []
+    try:
+        _write_metrics_csv(rows, base_path + '.csv')
+    except Exception as ex:
+        problems.append(f"metrics CSV: {ex}")
+    try:
+        _write_metrics_docx(rows, base_path + '.docx', heading)
+    except ImportError:
+        problems.append("metrics DOCX skipped: python-docx not installed (pip install python-docx)")
+    except Exception as ex:
+        problems.append(f"metrics DOCX: {ex}")
+    return problems
 
 
 # ─── page title helper ────────────────────────────────────────────────────────
@@ -2009,7 +2133,10 @@ class PlotGrid(QWidget):
         global_xmin: Optional[float] = None,
         global_xmax: Optional[float] = None,
         page_size:   Optional[Tuple[float, float]] = None,
+        metrics_out: Optional[list] = None,
     ) -> Figure:
+        """If `metrics_out` is given, one dict per analysed channel (plots
+        with Analysis enabled) is appended to it -- see _write_metrics_csv()."""
         rows   = layout.get('rows', self._rows)
         cols   = layout.get('cols', self._cols)
         snaps  = layout.get('plots', [])
@@ -2029,7 +2156,7 @@ class PlotGrid(QWidget):
         for ax in flat_axes:
             ax.yaxis.get_major_formatter().set_useOffset(False)
             ax.yaxis.get_major_formatter().set_scientific(False)
-        for ax, snap in zip(flat_axes, snaps):
+        for plot_idx, (ax, snap) in enumerate(zip(flat_axes, snaps), start=1):
             assigned  = snap.get('assigned', [])
             cfg       = snap.get('config', {})
             bands_on  = cfg.get('bands_enabled', False)
@@ -2111,6 +2238,17 @@ class PlotGrid(QWidget):
                         continue
                     metrics = _compute_signal_metrics(t, y, settle_pct=settle_pct,
                                                       xlim=xlim)
+                    if metrics_out is not None:
+                        metrics_out.append({
+                            'page_title': page_title,
+                            'plot':       plot_idx,
+                            'plot_title': cfg.get('title') or f"Plot {plot_idx}",
+                            'channel':    ch.get('legend_label') or ch['name'],
+                            'source':     ch['source'],
+                            'settle_pct': settle_pct,
+                            'xlim':       xlim,
+                            **metrics,
+                        })
                     txt = _draw_analysis_overlay(ax, metrics, color,
                                                  label_prefix=ch['source'])
                     if txt:
@@ -2560,6 +2698,8 @@ class ComparisonTabController(QWidget):
         self.page_title_sequence = []       # ordered list, matched to exported pages by
                                              # POSITION (not filename) -- see _export()'s
                                              # batch loop; set by AECST via --template
+        self.page_xlim_sequence = []        # per-page [xmin, xmax] (None = not set), by
+                                             # POSITION like page_title_sequence -- see _page_xlim()
         self._current_template_path = None  # set when a template is loaded (CLI or dialog);
                                              # _save_template() writes back here without prompting
         self._build()
@@ -2891,6 +3031,7 @@ class ComparisonTabController(QWidget):
         layout['datasets'] = self.registry.export_manifest()
         layout['page_titles'] = self.page_titles
         layout['page_title_sequence'] = self.page_title_sequence
+        layout['page_xlim_sequence'] = self.page_xlim_sequence
         try:
             os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
             with open(path, 'w', encoding='utf-8') as f:
@@ -2993,6 +3134,7 @@ class ComparisonTabController(QWidget):
 
         self.page_titles = layout.get('page_titles', {})
         self.page_title_sequence = layout.get('page_title_sequence', [])
+        self.page_xlim_sequence = layout.get('page_xlim_sequence', [])
 
         rows = layout.get('rows', 2)
         cols = layout.get('cols', 3)
@@ -3152,6 +3294,7 @@ class ComparisonTabController(QWidget):
 
         errors = []
         n_done = 0
+        metrics_rows: List[dict] = []
         for i in range(n_pages):
             if prog.wasCanceled():
                 break
@@ -3165,14 +3308,22 @@ class ComparisonTabController(QWidget):
             page_name = (pscad_ds.name if pscad_ds else None) or (psse_ds.name if psse_ds else f"page_{i+1}")
             iter_reg = DatasetRegistry.from_single(psse_ds=psse_ds, pscad_ds=pscad_ds)
 
+            page_xmin, page_xmax = _page_xlim(
+                self.page_xlim_sequence, i,
+                self.plot_grid._global_xmin, self.plot_grid._global_xmax)
+            page_metrics: List[dict] = []
             try:
                 fig = self.plot_grid.render_page(
                     iter_reg, offset, layout,
                     page_title=_page_title(page_name, i),
-                    global_xmin=self.plot_grid._global_xmin,
-                    global_xmax=self.plot_grid._global_xmax,
+                    global_xmin=page_xmin,
+                    global_xmax=page_xmax,
                     page_size=p['page_size'],
+                    metrics_out=page_metrics,
                 )
+                for m in page_metrics:
+                    m.update(page=i + 1, file=page_name)
+                metrics_rows.extend(page_metrics)
                 if fmt == 'PDF (combined)' and pdf_combined:
                     pdf_combined.savefig(fig, bbox_inches='tight')
                 elif fmt == 'PDF (per page)':
@@ -3189,8 +3340,12 @@ class ComparisonTabController(QWidget):
         if pdf_combined:
             pdf_combined.close()
 
+        errors.extend(_write_metrics_files(metrics_rows, str(out_dir / 'BOPPO_metrics')))
+
         prog.setValue(n_pages)
         msg = f"Exported {n_done} page(s) to:\n{out_dir}"
+        if metrics_rows:
+            msg += "\n\nRise/settle times: BOPPO_metrics.csv / .docx"
         if mismatched_counts:
             msg += (f"\n\nNote: PSSE folder has {len(psse_list)} file(s) and PSCAD folder "
                     f"has {len(pscad_list)} -- pages beyond the shorter list's length only "
@@ -3217,7 +3372,8 @@ class ComparisonTabController(QWidget):
         straight through to render_page()'s global_xmin/global_xmax) --
         this is a ONE-OFF render parameter for this PDF only, independent
         of (and never written back into) this tab's own global X-limit
-        fields/the loaded template's saved state.
+        fields/the loaded template's saved state. A per-page entry in
+        page_xlim_sequence (from the template) overrides them for that page.
 
         Returns (n_done, errors) -- errors is a list of "page_name: message"
         strings for pages that failed to render, matching _export()'s own
@@ -3244,17 +3400,24 @@ class ComparisonTabController(QWidget):
         pdf_combined = PdfPages(out_pdf_path)
         errors = []
         n_done = 0
+        metrics_rows: List[dict] = []
         for i, pscad_ds in enumerate(pscad_list):
             page_name = pscad_ds.name
             iter_reg = DatasetRegistry.from_single(pscad_ds=pscad_ds)
+            page_xmin, page_xmax = _page_xlim(self.page_xlim_sequence, i, xmin, xmax)
+            page_metrics: List[dict] = []
             try:
                 fig = self.plot_grid.render_page(
                     iter_reg, offset, layout,
                     page_title=_page_title(page_name, i),
-                    global_xmin=xmin,
-                    global_xmax=xmax,
+                    global_xmin=page_xmin,
+                    global_xmax=page_xmax,
                     page_size=page_size,
+                    metrics_out=page_metrics,
                 )
+                for m in page_metrics:
+                    m.update(page=i + 1, file=page_name)
+                metrics_rows.extend(page_metrics)
                 pdf_combined.savefig(fig, bbox_inches='tight')
                 plt.close(fig)
                 n_done += 1
@@ -3263,6 +3426,10 @@ class ComparisonTabController(QWidget):
                 plt.close('all')
 
         pdf_combined.close()
+        # Rise/settle times for plots with Analysis enabled, next to the PDF:
+        # <pdf stem>_metrics.csv / .docx
+        base = str(Path(out_pdf_path).with_suffix('')) + '_metrics'
+        errors.extend(_write_metrics_files(metrics_rows, base, heading=Path(out_pdf_path).stem))
         return n_done, errors
 
 

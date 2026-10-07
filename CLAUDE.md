@@ -43,7 +43,8 @@ Format-agnostic backends, all exposing `get(channel_name) → (time_array, data_
 
 ### Persistence (lines ~2209–2396)
 - `.boppo` files — JSON-serialized plot layouts (save/load templates), including `page_titles` (manual, filename-keyed) and `page_title_sequence` (positional, e.g. AECST-generated — see below)
-- Global settings: time offset, X-axis limits, grid dimensions
+- Global settings: grid dimensions. (The toolbar's global X-axis limits and time offset are NOT saved in templates.)
+- `page_xlim_sequence`: optional per-page `[xmin, xmax]` windows, by position (see below)
 - Per-plot settings: axis limits, legends, analysis parameters
 
 ## CLI: pre-loading a PSCAD folder and/or template at startup
@@ -112,6 +113,51 @@ by **row/page order, not by PSCAD's actual output filename** -- there is no
 code anywhere that inspects PSCAD's per-run output naming convention for
 this feature; it relies on the same file-order assumption the
 PSSE/PSCAD-pairing fix above already depends on.
+
+### Per-page X windows from AECST (`page_xlim_sequence`)
+
+`ComparisonTabController.page_xlim_sequence: List[[xmin, xmax]]` (each end
+may be `null`) is persisted in `.boppo` templates exactly like
+`page_title_sequence`. It's loaded in `_apply_template()` and written in
+`_write_template_file()`, with `[]` for older templates. Both batch loops
+(`_export()` and the headless `export_batch_pdf()`) call the module-level
+`_page_xlim(seq, i, fallback_min, fallback_max)` per page index `i`. Each
+end comes from `seq[i]` if set, otherwise from the fallback (the toolbar's
+global X limits, or the CLI `--xmin`/`--xmax`). The result is passed as
+`render_page()`'s `global_xmin`/`global_xmax`, so it also beats per-plot
+X limits, and the signal-analysis window follows it. Y autoscaling
+already uses only the visible X window, so each page's Y fits its own
+window unless a plot has fixed Y limits. AECST populates this from its
+per-test "X min (s)"/"X max (s)" table columns
+(`aecst_presets.build_xlim_sequence()`).
+
+### Batch rise/settle metrics export (CSV + DOCX)
+
+`render_page(..., metrics_out=list)` appends one dict per analysed channel
+(plots with Analysis enabled), holding `_compute_signal_metrics()`'s
+output plus plot title, channel (its legend label if set), source,
+settle %, and the X window used. Both batch loops collect these per page,
+adding `page`/`file`, then call `_write_metrics_files(rows, base_path)`:
+- `<base>.csv` always gets the full column set (`_METRICS_COLUMNS`, UTF-8 with BOM for Excel).
+- `<base>.docx` gets a landscape Word table with the key subset (`_METRICS_DOCX_KEYS`) via python-docx. It's skipped with a reported problem if python-docx isn't installed.
+
+Channels with no detectable step leave the numeric cells blank and get
+the note "No step detected in window". Nothing is written if no plot has
+Analysis enabled. File names:
+- interactive batch export: `BOPPO_metrics.*` in the output folder;
+- headless `--export-pdf X.pdf`: `X_metrics.*` next to the PDF.
+
+Write failures are added to the export's error list and never stop the
+PDF. `boppo.spec` bundles python-docx's data files.
+
+### Headless PDF export CLI
+
+`--export-pdf <path>` (with `--pscad-folder`/`--template`) renders the
+combined batch PDF via `export_batch_pdf()` without showing the window,
+then exits. `--page-size <key>` is a `PAGE_SIZES` key, and `--xmin`/`--xmax`
+set a one-off global X window for that export (never saved). Per-page
+`page_xlim_sequence` entries override `--xmin`/`--xmax`. AECST launches this
+in the background after every run.
 
 (Note: the current code uses a `ComparisonTabController` class managed by
 `MainWindow.tabs`, not the older `MainWindow` two-tab-with-`_t2_`-prefix

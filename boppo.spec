@@ -8,6 +8,7 @@ a = Analysis(
     binaries=[],
     datas=[
         *collect_data_files('openpyxl'),
+        *collect_data_files('docx'),  # python-docx default template, for the metrics .docx
         *collect_data_files('matplotlib'),
     ],
     hiddenimports=[
@@ -17,6 +18,7 @@ a = Analysis(
         'matplotlib.backends.backend_pdf',
         'matplotlib.backends.backend_agg',
         'numpy.lib.format',
+        'docx',
     ],
     excludes=['psse3605', 'psspy', 'dyntools', 'mhi'],
     hookspath=[],
